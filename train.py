@@ -79,6 +79,40 @@ def saveRuntimeCode(dst: str) -> None:
     print('Backup Finished!')
 
 
+def sample_neural_gaussian_errors(viewpoint_camera, neural_xyz, visibility_filter, error_map):
+    if neural_xyz.numel() == 0:
+        empty_errors = torch.zeros((0, 1), dtype=error_map.dtype, device=error_map.device)
+        empty_mask = torch.zeros((0,), dtype=torch.bool, device=error_map.device)
+        return empty_errors, empty_mask
+
+    height, width = error_map.shape
+    errors = torch.zeros((neural_xyz.shape[0], 1), dtype=error_map.dtype, device=error_map.device)
+    valid_mask = torch.zeros((neural_xyz.shape[0],), dtype=torch.bool, device=error_map.device)
+
+    active_mask = visibility_filter.detach()
+    if active_mask.sum() == 0:
+        return errors, valid_mask
+
+    xyz = neural_xyz.detach()[active_mask]
+    ones = torch.ones((xyz.shape[0], 1), dtype=xyz.dtype, device=xyz.device)
+    xyz_hom = torch.cat([xyz, ones], dim=1)
+    projected = torch.matmul(xyz_hom, viewpoint_camera.full_proj_transform)
+    denom = projected[:, 3].abs().clamp_min(1e-7)
+    ndc = projected[:, :3] / denom.unsqueeze(1)
+
+    px = torch.round((ndc[:, 0] + 1.0) * 0.5 * (width - 1)).long()
+    py = torch.round((1.0 - ndc[:, 1]) * 0.5 * (height - 1)).long()
+    in_image = (px >= 0) & (px < width) & (py >= 0) & (py < height)
+
+    active_indices = torch.nonzero(active_mask, as_tuple=False).squeeze(1)
+    if in_image.sum() > 0:
+        target_indices = active_indices[in_image]
+        errors[target_indices, 0] = error_map[py[in_image], px[in_image]]
+        valid_mask[target_indices] = True
+
+    return errors, valid_mask
+
+
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -138,6 +172,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
         gt_image = viewpoint_cam.original_image.cuda()
+        neural_errors = None
+        neural_error_filter = None
+        if opt.use_error_aware_refinement and iteration < opt.update_until and iteration > opt.start_stat:
+            error_map = torch.abs(image.detach() - gt_image.detach()).mean(dim=0)
+            neural_errors, neural_error_filter = sample_neural_gaussian_errors(
+                viewpoint_cam, render_pkg["neural_xyz"], visibility_filter, error_map
+            )
         Ll1 = l1_loss(image, gt_image)
 
         ssim_loss = (1.0 - ssim(image, gt_image))
@@ -167,7 +208,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             # densification
             if iteration < opt.update_until and iteration > opt.start_stat:
                 # add statis
-                gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask)
+                gaussians.training_statis(
+                    viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask,
+                    neural_errors=neural_errors,
+                    neural_error_filter=neural_error_filter,
+                    neural_offset_indices=render_pkg.get("neural_offset_indices", None),
+                    neural_anchor_indices=render_pkg.get("neural_anchor_indices", None),
+                )
                 
                 # densification
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
@@ -176,6 +223,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
                 del gaussians.offset_denom
+                if getattr(gaussians, "use_error_aware_refinement", False):
+                    del gaussians.offset_error_accum
+                    del gaussians.offset_error_denom
+                    del gaussians.anchor_error_accum
+                    del gaussians.anchor_error_denom
                 torch.cuda.empty_cache()
                     
             # Optimizer step

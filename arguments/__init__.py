@@ -152,6 +152,13 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
+        # Optional error-aware anchor refinement. Disabled by default to keep
+        # the original Scaffold-GS baseline unchanged.
+        self.use_error_aware_refinement = False
+        self.error_grow_weight = 0.5
+        self.error_norm_clip = 3.0
+        self.error_prune_keep_ratio = 1.0
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -79,6 +79,14 @@ class GaussianModel:
         self._anchor_feat = torch.empty(0)
         
         self.opacity_accum = torch.empty(0)
+        self.offset_error_accum = torch.empty(0)
+        self.offset_error_denom = torch.empty(0)
+        self.anchor_error_accum = torch.empty(0)
+        self.anchor_error_denom = torch.empty(0)
+        self.use_error_aware_refinement = False
+        self.error_grow_weight = 0.5
+        self.error_norm_clip = 3.0
+        self.error_prune_keep_ratio = 1.0
 
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
@@ -274,12 +282,20 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        self.use_error_aware_refinement = getattr(training_args, "use_error_aware_refinement", False)
+        self.error_grow_weight = getattr(training_args, "error_grow_weight", 0.5)
+        self.error_norm_clip = getattr(training_args, "error_norm_clip", 3.0)
+        self.error_prune_keep_ratio = getattr(training_args, "error_prune_keep_ratio", 1.0)
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.offset_error_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
+        self.offset_error_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
+        self.anchor_error_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.anchor_error_denom = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
         
         
@@ -506,7 +522,8 @@ class GaussianModel:
 
 
     # statis grad information to guide liftting. 
-    def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask):
+    def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask,
+                        neural_errors=None, neural_error_filter=None, neural_offset_indices=None, neural_anchor_indices=None):
         # update opacity stats
         temp_opacity = opacity.clone().view(-1).detach()
         temp_opacity[temp_opacity<0] = 0
@@ -527,6 +544,18 @@ class GaussianModel:
         grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.offset_gradient_accum[combined_mask] += grad_norm
         self.offset_denom[combined_mask] += 1
+
+        if self.use_error_aware_refinement and neural_errors is not None and neural_offset_indices is not None and neural_anchor_indices is not None:
+            error_filter = update_filter if neural_error_filter is None else torch.logical_and(update_filter, neural_error_filter)
+            if error_filter.sum() > 0:
+                error_values = neural_errors[error_filter].detach().view(-1, 1)
+                offset_indices = neural_offset_indices[error_filter].detach().long().view(-1, 1)
+                anchor_indices = neural_anchor_indices[error_filter].detach().long().view(-1, 1)
+                ones = torch.ones_like(error_values)
+                self.offset_error_accum.scatter_add_(0, offset_indices, error_values)
+                self.offset_error_denom.scatter_add_(0, offset_indices, ones)
+                self.anchor_error_accum.scatter_add_(0, anchor_indices, error_values)
+                self.anchor_error_denom.scatter_add_(0, anchor_indices, ones)
 
         
 
@@ -684,8 +713,37 @@ class GaussianModel:
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
+
+        grow_scores = grads_norm
+        if self.use_error_aware_refinement and self.offset_error_denom.numel() == self.offset_gradient_accum.numel():
+            offset_error_mean = self.offset_error_accum / self.offset_error_denom.clamp_min(1.0)
+            observed_error = (self.offset_error_denom > 0).squeeze(dim=1)
+            if observed_error.sum() > 0:
+                mean_error = offset_error_mean[observed_error].mean().clamp_min(1e-6)
+                error_norm = (offset_error_mean.squeeze(dim=1) / mean_error).clamp(max=self.error_norm_clip)
+                grow_scores = grads_norm * (1.0 + self.error_grow_weight * error_norm)
         
-        self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+        self.anchor_growing(grow_scores, grad_threshold, offset_mask)
+
+        if self.use_error_aware_refinement:
+            self.offset_error_accum[offset_mask] = 0
+            self.offset_error_denom[offset_mask] = 0
+            padding_offset_error = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_error_accum.shape[0], 1],
+                                               dtype=self.offset_error_accum.dtype,
+                                               device=self.offset_error_accum.device)
+            self.offset_error_accum = torch.cat([self.offset_error_accum, padding_offset_error], dim=0)
+            padding_offset_error_denom = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_error_denom.shape[0], 1],
+                                                     dtype=self.offset_error_denom.dtype,
+                                                     device=self.offset_error_denom.device)
+            self.offset_error_denom = torch.cat([self.offset_error_denom, padding_offset_error_denom], dim=0)
+            padding_anchor_error = torch.zeros([self.get_anchor.shape[0] - self.anchor_error_accum.shape[0], 1],
+                                               dtype=self.anchor_error_accum.dtype,
+                                               device=self.anchor_error_accum.device)
+            self.anchor_error_accum = torch.cat([self.anchor_error_accum, padding_anchor_error], dim=0)
+            padding_anchor_error_denom = torch.zeros([self.get_anchor.shape[0] - self.anchor_error_denom.shape[0], 1],
+                                                     dtype=self.anchor_error_denom.dtype,
+                                                     device=self.anchor_error_denom.device)
+            self.anchor_error_denom = torch.cat([self.anchor_error_denom, padding_anchor_error_denom], dim=0)
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0
@@ -704,6 +762,14 @@ class GaussianModel:
         prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
         anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1) # [N, 1]
         prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N] 
+
+        if self.use_error_aware_refinement and self.anchor_error_denom.numel() == self.opacity_accum.numel():
+            anchor_error_mean = self.anchor_error_accum / self.anchor_error_denom.clamp_min(1.0)
+            observed_anchor_error = (self.anchor_error_denom > 0).squeeze(dim=1)
+            if observed_anchor_error.sum() > 0:
+                mean_anchor_error = anchor_error_mean[observed_anchor_error].mean().clamp_min(1e-6)
+                high_error_anchor = anchor_error_mean.squeeze(dim=1) > mean_anchor_error * self.error_prune_keep_ratio
+                prune_mask = torch.logical_and(prune_mask, ~high_error_anchor)
         
         # update offset_denom
         offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
@@ -715,11 +781,24 @@ class GaussianModel:
         offset_gradient_accum = offset_gradient_accum.view([-1, 1])
         del self.offset_gradient_accum
         self.offset_gradient_accum = offset_gradient_accum
+
+        if self.use_error_aware_refinement:
+            offset_error_accum = self.offset_error_accum.view([-1, self.n_offsets])[~prune_mask]
+            offset_error_accum = offset_error_accum.view([-1, 1])
+            offset_error_denom = self.offset_error_denom.view([-1, self.n_offsets])[~prune_mask]
+            offset_error_denom = offset_error_denom.view([-1, 1])
+            del self.offset_error_accum
+            del self.offset_error_denom
+            self.offset_error_accum = offset_error_accum
+            self.offset_error_denom = offset_error_denom
         
         # update opacity accum 
         if anchors_mask.sum()>0:
-            self.opacity_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
-            self.anchor_demon[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
+            self.opacity_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
+            self.anchor_demon[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
+            if self.use_error_aware_refinement:
+                self.anchor_error_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
+                self.anchor_error_denom[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
         
         temp_opacity_accum = self.opacity_accum[~prune_mask]
         del self.opacity_accum
@@ -728,6 +807,14 @@ class GaussianModel:
         temp_anchor_demon = self.anchor_demon[~prune_mask]
         del self.anchor_demon
         self.anchor_demon = temp_anchor_demon
+
+        if self.use_error_aware_refinement:
+            temp_anchor_error_accum = self.anchor_error_accum[~prune_mask]
+            temp_anchor_error_denom = self.anchor_error_denom[~prune_mask]
+            del self.anchor_error_accum
+            del self.anchor_error_denom
+            self.anchor_error_accum = temp_anchor_error_accum
+            self.anchor_error_denom = temp_anchor_error_denom
 
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)
