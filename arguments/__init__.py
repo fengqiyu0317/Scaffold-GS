@@ -159,6 +159,11 @@ class OptimizationParams(ParamGroup):
         self.error_norm_clip = 3.0
         self.error_prune_keep_ratio = 1.0
 
+        # Optional dynamic error-weighted photometric loss.
+        self.use_error_weighted_loss = False
+        self.lambda_error_loss = 0.25
+        self.error_loss_clip = 3.0
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

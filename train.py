@@ -174,16 +174,26 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gt_image = viewpoint_cam.original_image.cuda()
         neural_errors = None
         neural_error_filter = None
-        if opt.use_error_aware_refinement and iteration < opt.update_until and iteration > opt.start_stat:
+        error_map = None
+        needs_error_map = opt.use_error_weighted_loss or (
+            opt.use_error_aware_refinement and iteration < opt.update_until and iteration > opt.start_stat
+        )
+        if needs_error_map:
             error_map = torch.abs(image.detach() - gt_image.detach()).mean(dim=0)
+        if opt.use_error_aware_refinement and iteration < opt.update_until and iteration > opt.start_stat:
             neural_errors, neural_error_filter = sample_neural_gaussian_errors(
                 viewpoint_cam, render_pkg["neural_xyz"], visibility_filter, error_map
             )
         Ll1 = l1_loss(image, gt_image)
+        Ll1_for_loss = Ll1
+        if opt.use_error_weighted_loss:
+            error_norm = error_map / error_map.mean().clamp_min(1e-6)
+            error_weight = 1.0 + opt.lambda_error_loss * error_norm.clamp(max=opt.error_loss_clip)
+            Ll1_for_loss = (error_weight * torch.abs(image - gt_image).mean(dim=0)).mean()
 
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+        loss = (1.0 - opt.lambda_dssim) * Ll1_for_loss + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
 
         loss.backward()
         
