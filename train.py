@@ -21,6 +21,7 @@ os.system('echo $CUDA_VISIBLE_DEVICES')
 
 
 import torch
+import torch.nn.functional as F
 import torchvision
 import json
 import wandb
@@ -79,7 +80,72 @@ def saveRuntimeCode(dst: str) -> None:
     print('Backup Finished!')
 
 
-def sample_neural_gaussian_errors(viewpoint_camera, neural_xyz, visibility_filter, error_map):
+def build_refinement_error_map(image, gt_image, opt):
+    image = image.detach().clamp(0.0, 1.0)
+    gt_image = gt_image.detach().clamp(0.0, 1.0)
+
+    luma_weight = getattr(opt, "error_luma_weight", 0.50)
+    chroma_weight = getattr(opt, "error_chroma_weight", 0.40)
+    edge_weight = getattr(opt, "error_edge_weight", 0.35)
+    highlight_weight = getattr(opt, "error_highlight_weight", 0.75)
+    highlight_threshold = getattr(opt, "error_highlight_threshold", 0.65)
+    structure_weight = getattr(opt, "error_structure_weight", 0.50)
+    structure_kernel = max(3, int(getattr(opt, "error_structure_kernel", 15)))
+    local_max_weight = getattr(opt, "error_local_max_weight", 0.60)
+    local_mean_weight = getattr(opt, "error_local_mean_weight", 0.15)
+    local_kernel = max(1, int(getattr(opt, "error_local_kernel", 7)))
+    if local_kernel % 2 == 0:
+        local_kernel += 1
+    if structure_kernel % 2 == 0:
+        structure_kernel += 1
+
+    rgb_error = torch.abs(image - gt_image).mean(dim=0, keepdim=True)
+
+    luma_coeff = image.new_tensor([0.299, 0.587, 0.114]).view(3, 1, 1)
+    pred_luma = (image * luma_coeff).sum(dim=0, keepdim=True)
+    gt_luma = (gt_image * luma_coeff).sum(dim=0, keepdim=True)
+    luma_error = torch.abs(pred_luma - gt_luma)
+
+    pred_chroma = image - pred_luma
+    gt_chroma = gt_image - gt_luma
+    chroma_error = torch.sqrt((pred_chroma - gt_chroma).pow(2).sum(dim=0, keepdim=True) + 1e-12) / (3.0 ** 0.5)
+
+    highlight_mask = ((gt_luma - highlight_threshold) / max(1e-6, 1.0 - highlight_threshold)).clamp(0.0, 1.0)
+    highlight_error = torch.relu(gt_luma - pred_luma) * highlight_mask
+
+    base_error = rgb_error + luma_weight * luma_error + chroma_weight * chroma_error + highlight_weight * highlight_error
+    base_error = base_error / max(1e-6, 1.0 + luma_weight + chroma_weight + highlight_weight)
+
+    if edge_weight > 0:
+        sobel_x = image.new_tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]).view(1, 1, 3, 3) / 4.0
+        sobel_y = image.new_tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]).view(1, 1, 3, 3) / 4.0
+        pred_luma_4d = pred_luma.unsqueeze(0)
+        gt_luma_4d = gt_luma.unsqueeze(0)
+        pred_grad_x = F.conv2d(pred_luma_4d, sobel_x, padding=1)
+        pred_grad_y = F.conv2d(pred_luma_4d, sobel_y, padding=1)
+        gt_grad_x = F.conv2d(gt_luma_4d, sobel_x, padding=1)
+        gt_grad_y = F.conv2d(gt_luma_4d, sobel_y, padding=1)
+        edge_error = torch.sqrt((pred_grad_x - gt_grad_x).pow(2) + (pred_grad_y - gt_grad_y).pow(2) + 1e-12).squeeze(0)
+        base_error = (base_error + edge_weight * edge_error) / (1.0 + edge_weight)
+
+    error_4d = base_error.unsqueeze(0)
+    if structure_weight > 0 and structure_kernel > 1:
+        structure_padding = structure_kernel // 2
+        vertical_error = F.max_pool2d(error_4d, kernel_size=(structure_kernel, 3), stride=1, padding=(structure_padding, 1))
+        horizontal_error = F.max_pool2d(error_4d, kernel_size=(3, structure_kernel), stride=1, padding=(1, structure_padding))
+        line_error = torch.maximum(vertical_error, horizontal_error)
+        error_4d = (error_4d + structure_weight * line_error) / (1.0 + structure_weight)
+
+    if local_kernel > 1:
+        padding = local_kernel // 2
+        local_max = F.max_pool2d(error_4d, kernel_size=local_kernel, stride=1, padding=padding)
+        local_mean = F.avg_pool2d(error_4d, kernel_size=local_kernel, stride=1, padding=padding)
+        error_4d = (error_4d + local_max_weight * local_max + local_mean_weight * local_mean) / max(1e-6, 1.0 + local_max_weight + local_mean_weight)
+
+    return error_4d.squeeze(0).squeeze(0)
+
+
+def sample_neural_gaussian_errors(viewpoint_camera, neural_xyz, visibility_filter, error_map, opt=None):
     if neural_xyz.numel() == 0:
         empty_errors = torch.zeros((0, 1), dtype=error_map.dtype, device=error_map.device)
         empty_mask = torch.zeros((0,), dtype=torch.bool, device=error_map.device)
@@ -100,14 +166,32 @@ def sample_neural_gaussian_errors(viewpoint_camera, neural_xyz, visibility_filte
     denom = projected[:, 3].abs().clamp_min(1e-7)
     ndc = projected[:, :3] / denom.unsqueeze(1)
 
-    px = torch.round((ndc[:, 0] + 1.0) * 0.5 * (width - 1)).long()
-    py = torch.round((1.0 - ndc[:, 1]) * 0.5 * (height - 1)).long()
-    in_image = (px >= 0) & (px < width) & (py >= 0) & (py < height)
+    grid = torch.stack([ndc[:, 0], -ndc[:, 1]], dim=-1)
+    in_image = (grid[:, 0] >= -1.0) & (grid[:, 0] <= 1.0) & (grid[:, 1] >= -1.0) & (grid[:, 1] <= 1.0)
 
     active_indices = torch.nonzero(active_mask, as_tuple=False).squeeze(1)
     if in_image.sum() > 0:
         target_indices = active_indices[in_image]
-        errors[target_indices, 0] = error_map[py[in_image], px[in_image]]
+        valid_grid = grid[in_image]
+        error_image = error_map.view(1, 1, height, width)
+        sample_radius = 0.0 if opt is None else float(getattr(opt, "error_sample_radius", 4.0))
+        sample_max_weight = 0.0 if opt is None else float(getattr(opt, "error_sample_max_weight", 0.85))
+        if sample_radius > 0.0:
+            dx = 2.0 * sample_radius / max(width - 1, 1)
+            dy = 2.0 * sample_radius / max(height - 1, 1)
+            offsets = valid_grid.new_tensor([
+                [0.0, 0.0], [dx, 0.0], [-dx, 0.0], [0.0, dy], [0.0, -dy],
+                [dx, dy], [dx, -dy], [-dx, dy], [-dx, -dy],
+            ])
+            sample_grid = (valid_grid.unsqueeze(1) + offsets.unsqueeze(0)).view(1, valid_grid.shape[0], offsets.shape[0], 2)
+            sampled = F.grid_sample(error_image, sample_grid, mode="bilinear", padding_mode="zeros", align_corners=True).view(valid_grid.shape[0], offsets.shape[0])
+            center_errors = sampled[:, 0]
+            max_errors = sampled.max(dim=1)[0]
+            sampled_errors = center_errors * (1.0 - sample_max_weight) + max_errors * sample_max_weight
+        else:
+            sample_grid = valid_grid.view(1, -1, 1, 2)
+            sampled_errors = F.grid_sample(error_image, sample_grid, mode="bilinear", padding_mode="zeros", align_corners=True).view(-1)
+        errors[target_indices, 0] = sampled_errors
         valid_mask[target_indices] = True
 
     return errors, valid_mask
@@ -175,9 +259,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         neural_errors = None
         neural_error_filter = None
         if opt.use_error_aware_refinement and iteration < opt.update_until and iteration > opt.start_stat:
-            error_map = torch.abs(image.detach() - gt_image.detach()).mean(dim=0)
+            error_map = build_refinement_error_map(image, gt_image, opt)
             neural_errors, neural_error_filter = sample_neural_gaussian_errors(
-                viewpoint_cam, render_pkg["neural_xyz"], visibility_filter, error_map
+                viewpoint_cam, render_pkg["neural_xyz"], visibility_filter, error_map, opt
             )
         Ll1 = l1_loss(image, gt_image)
 
