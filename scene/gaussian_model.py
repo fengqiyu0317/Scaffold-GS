@@ -84,9 +84,11 @@ class GaussianModel:
         self.anchor_error_accum = torch.empty(0)
         self.anchor_error_denom = torch.empty(0)
         self.use_error_aware_refinement = False
-        self.error_grow_weight = 0.5
-        self.error_norm_clip = 3.0
+        self.error_grow_weight = 1.0
+        self.error_norm_clip = 4.0
         self.error_prune_keep_ratio = 1.0
+        self.error_score_add_weight = 0.25
+        self.error_visit_threshold_scale = 0.35
 
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
@@ -283,9 +285,11 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.use_error_aware_refinement = getattr(training_args, "use_error_aware_refinement", False)
-        self.error_grow_weight = getattr(training_args, "error_grow_weight", 0.5)
-        self.error_norm_clip = getattr(training_args, "error_norm_clip", 3.0)
+        self.error_grow_weight = getattr(training_args, "error_grow_weight", 1.0)
+        self.error_norm_clip = getattr(training_args, "error_norm_clip", 4.0)
         self.error_prune_keep_ratio = getattr(training_args, "error_prune_keep_ratio", 1.0)
+        self.error_score_add_weight = getattr(training_args, "error_score_add_weight", 0.25)
+        self.error_visit_threshold_scale = getattr(training_args, "error_visit_threshold_scale", 0.35)
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
@@ -712,7 +716,8 @@ class GaussianModel:
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
-        offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
+        visit_threshold_scale = self.error_visit_threshold_scale if self.use_error_aware_refinement else 0.5
+        offset_mask = (self.offset_denom > check_interval * success_threshold * visit_threshold_scale).squeeze(dim=1)
 
         grow_scores = grads_norm
         if self.use_error_aware_refinement and self.offset_error_denom.numel() == self.offset_gradient_accum.numel():
@@ -721,7 +726,9 @@ class GaussianModel:
             if observed_error.sum() > 0:
                 mean_error = offset_error_mean[observed_error].mean().clamp_min(1e-6)
                 error_norm = (offset_error_mean.squeeze(dim=1) / mean_error).clamp(max=self.error_norm_clip)
-                grow_scores = grads_norm * (1.0 + self.error_grow_weight * error_norm)
+                multiplicative_score = grads_norm * (1.0 + self.error_grow_weight * error_norm)
+                additive_score = grad_threshold * self.error_score_add_weight * error_norm
+                grow_scores = multiplicative_score + additive_score
         
         self.anchor_growing(grow_scores, grad_threshold, offset_mask)
 

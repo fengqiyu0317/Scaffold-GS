@@ -155,9 +155,23 @@ class OptimizationParams(ParamGroup):
         # Optional error-aware anchor refinement. Disabled by default to keep
         # the original Scaffold-GS baseline unchanged.
         self.use_error_aware_refinement = False
-        self.error_grow_weight = 0.5
-        self.error_norm_clip = 3.0
+        self.error_grow_weight = 1.0
+        self.error_norm_clip = 4.0
         self.error_prune_keep_ratio = 1.0
+        self.error_luma_weight = 0.50
+        self.error_chroma_weight = 0.40
+        self.error_edge_weight = 0.35
+        self.error_highlight_weight = 0.75
+        self.error_highlight_threshold = 0.65
+        self.error_structure_weight = 0.50
+        self.error_structure_kernel = 15
+        self.error_local_max_weight = 0.60
+        self.error_local_mean_weight = 0.15
+        self.error_local_kernel = 7
+        self.error_sample_radius = 4.0
+        self.error_sample_max_weight = 0.85
+        self.error_score_add_weight = 0.25
+        self.error_visit_threshold_scale = 0.35
 
         super().__init__(parser, "Optimization Parameters")
 
