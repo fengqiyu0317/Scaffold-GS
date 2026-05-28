@@ -10,6 +10,7 @@
 #
 
 import torch
+import math
 from functools import reduce
 import numpy as np
 from torch_scatter import scatter_max
@@ -43,6 +44,42 @@ class GaussianModel:
 
         self.rotation_activation = torch.nn.functional.normalize
 
+    def _encoded_dim(self, input_dim, num_freqs):
+        if not self.use_viewdist_pe:
+            return input_dim
+        encoded_dim = input_dim if self.pe_include_input else 0
+        encoded_dim += 2 * input_dim * max(0, int(num_freqs))
+        return encoded_dim
+
+    def _positional_encoding(self, values, num_freqs, include_input=True):
+        if not self.use_viewdist_pe:
+            return values
+
+        encoded = []
+        if include_input:
+            encoded.append(values)
+
+        num_freqs = max(0, int(num_freqs))
+        if num_freqs > 0:
+            freq_bands = (2.0 ** torch.arange(num_freqs, dtype=values.dtype, device=values.device)) * math.pi
+            scaled = values.unsqueeze(-1) * freq_bands.view(*([1] * values.dim()), num_freqs)
+            scaled = scaled.flatten(start_dim=1)
+            encoded.extend([torch.sin(scaled), torch.cos(scaled)])
+
+        if not encoded:
+            return values.new_zeros((values.shape[0], 0))
+        return torch.cat(encoded, dim=1)
+
+    def encode_view(self, view):
+        return self._positional_encoding(view, self.view_pe_freqs, self.pe_include_input)
+
+    def encode_dist(self, dist):
+        if not self.use_viewdist_pe:
+            return dist
+        scene_scale = max(float(self.spatial_lr_scale), 1e-6) if self.spatial_lr_scale else 1.0
+        normalized_dist = torch.log1p(dist / scene_scale)
+        return self._positional_encoding(normalized_dist, self.dist_pe_freqs, self.pe_include_input)
+
 
     def __init__(self, 
                  feat_dim: int=32, 
@@ -57,6 +94,10 @@ class GaussianModel:
                  add_opacity_dist : bool = False,
                  add_cov_dist : bool = False,
                  add_color_dist : bool = False,
+                 use_viewdist_pe : bool = False,
+                 view_pe_freqs : int = 4,
+                 dist_pe_freqs : int = 3,
+                 pe_include_input : bool = True,
                  ):
 
         self.feat_dim = feat_dim
@@ -73,6 +114,13 @@ class GaussianModel:
         self.add_opacity_dist = add_opacity_dist
         self.add_cov_dist = add_cov_dist
         self.add_color_dist = add_color_dist
+        self.use_viewdist_pe = use_viewdist_pe
+        self.view_pe_freqs = max(0, int(view_pe_freqs))
+        self.dist_pe_freqs = max(0, int(dist_pe_freqs))
+        self.pe_include_input = pe_include_input
+        self.view_dim = self._encoded_dim(3, self.view_pe_freqs)
+        self.dist_dim = self._encoded_dim(1, self.dist_pe_freqs)
+        self.featurebank_input_dim = self.view_dim + self.dist_dim
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -125,31 +173,31 @@ class GaussianModel:
 
         if self.use_feat_bank:
             self.mlp_feature_bank = nn.Sequential(
-                nn.Linear(3+1, feat_dim),
+                nn.Linear(self.featurebank_input_dim, feat_dim),
                 nn.ReLU(True),
                 nn.Linear(feat_dim, 3),
                 nn.Softmax(dim=1)
             ).cuda()
 
-        self.opacity_dist_dim = 1 if self.add_opacity_dist else 0
+        self.opacity_dist_dim = self.dist_dim if self.add_opacity_dist else 0
         self.mlp_opacity = nn.Sequential(
-            nn.Linear(feat_dim+3+self.opacity_dist_dim, feat_dim),
+            nn.Linear(feat_dim+self.view_dim+self.opacity_dist_dim, feat_dim),
             nn.ReLU(True),
             nn.Linear(feat_dim, n_offsets),
             nn.Tanh()
         ).cuda()
 
         self.add_cov_dist = add_cov_dist
-        self.cov_dist_dim = 1 if self.add_cov_dist else 0
+        self.cov_dist_dim = self.dist_dim if self.add_cov_dist else 0
         self.mlp_cov = nn.Sequential(
-            nn.Linear(feat_dim+3+self.cov_dist_dim, feat_dim),
+            nn.Linear(feat_dim+self.view_dim+self.cov_dist_dim, feat_dim),
             nn.ReLU(True),
             nn.Linear(feat_dim, 7*self.n_offsets),
         ).cuda()
 
-        self.color_dist_dim = 1 if self.add_color_dist else 0
+        self.color_dist_dim = self.dist_dim if self.add_color_dist else 0
         self.mlp_color = nn.Sequential(
-            nn.Linear(feat_dim+3+self.color_dist_dim+self.appearance_dim, feat_dim),
+            nn.Linear(feat_dim+self.view_dim+self.color_dist_dim+self.appearance_dim, feat_dim),
             nn.ReLU(True),
             nn.Linear(feat_dim, 3*self.n_offsets),
             nn.Sigmoid()
@@ -1121,23 +1169,23 @@ class GaussianModel:
         mkdir_p(os.path.dirname(path))
         if mode == 'split':
             self.mlp_opacity.eval()
-            opacity_mlp = torch.jit.trace(self.mlp_opacity, (torch.rand(1, self.feat_dim+3+self.opacity_dist_dim).cuda()))
+            opacity_mlp = torch.jit.trace(self.mlp_opacity, (torch.rand(1, self.feat_dim+self.view_dim+self.opacity_dist_dim).cuda()))
             opacity_mlp.save(os.path.join(path, 'opacity_mlp.pt'))
             self.mlp_opacity.train()
 
             self.mlp_cov.eval()
-            cov_mlp = torch.jit.trace(self.mlp_cov, (torch.rand(1, self.feat_dim+3+self.cov_dist_dim).cuda()))
+            cov_mlp = torch.jit.trace(self.mlp_cov, (torch.rand(1, self.feat_dim+self.view_dim+self.cov_dist_dim).cuda()))
             cov_mlp.save(os.path.join(path, 'cov_mlp.pt'))
             self.mlp_cov.train()
 
             self.mlp_color.eval()
-            color_mlp = torch.jit.trace(self.mlp_color, (torch.rand(1, self.feat_dim+3+self.color_dist_dim+self.appearance_dim).cuda()))
+            color_mlp = torch.jit.trace(self.mlp_color, (torch.rand(1, self.feat_dim+self.view_dim+self.color_dist_dim+self.appearance_dim).cuda()))
             color_mlp.save(os.path.join(path, 'color_mlp.pt'))
             self.mlp_color.train()
 
             if self.use_feat_bank:
                 self.mlp_feature_bank.eval()
-                feature_bank_mlp = torch.jit.trace(self.mlp_feature_bank, (torch.rand(1, 3+1).cuda()))
+                feature_bank_mlp = torch.jit.trace(self.mlp_feature_bank, (torch.rand(1, self.featurebank_input_dim).cuda()))
                 feature_bank_mlp.save(os.path.join(path, 'feature_bank_mlp.pt'))
                 self.mlp_feature_bank.train()
 

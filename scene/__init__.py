@@ -74,6 +74,7 @@ class Scene:
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
+        self.gaussians.spatial_lr_scale = self.cameras_extent
 
         # print(f'self.cameras_extent: {self.cameras_extent}')
 

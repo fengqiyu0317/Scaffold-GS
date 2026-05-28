@@ -75,6 +75,10 @@ class ModelParams(ParamGroup):
         self.add_opacity_dist = False
         self.add_cov_dist = False
         self.add_color_dist = False
+        self.use_viewdist_pe = False
+        self.view_pe_freqs = 4
+        self.dist_pe_freqs = 3
+        self.pe_include_input = True
         
         super().__init__(parser, "Loading Parameters", sentinel)
 
