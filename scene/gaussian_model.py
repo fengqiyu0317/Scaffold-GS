@@ -89,6 +89,24 @@ class GaussianModel:
         self.error_prune_keep_ratio = 1.0
         self.error_score_add_weight = 0.25
         self.error_visit_threshold_scale = 0.35
+        self.use_component_refinement = False
+        self.component_score_add_weight = 0.35
+        self.component_norm_clip = 4.0
+        self.component_budget_ratio = 0.01
+        self.component_max_anchor_ratio = 2.80
+        self.component_min_views = 2
+        self.component_visit_threshold_scale = 0.25
+        self.component_proposal_level = 0
+        self.component_candidate_max_per_interval = 512
+        self.initial_anchor_count = 0
+        self.offset_component_accum = torch.empty(0)
+        self.offset_component_denom = torch.empty(0)
+        self.offset_component_proposal_accum = torch.empty(0)
+        self.offset_component_proposal_denom = torch.empty(0)
+        self.anchor_component_accum = torch.empty(0)
+        self.anchor_component_denom = torch.empty(0)
+        self.anchor_component_views = torch.empty(0)
+        self.component_candidate_xyz = torch.empty(0)
 
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
@@ -290,6 +308,16 @@ class GaussianModel:
         self.error_prune_keep_ratio = getattr(training_args, "error_prune_keep_ratio", 1.0)
         self.error_score_add_weight = getattr(training_args, "error_score_add_weight", 0.25)
         self.error_visit_threshold_scale = getattr(training_args, "error_visit_threshold_scale", 0.35)
+        self.use_component_refinement = getattr(training_args, "use_component_refinement", False)
+        self.component_score_add_weight = getattr(training_args, "component_score_add_weight", 0.35)
+        self.component_norm_clip = getattr(training_args, "component_norm_clip", 4.0)
+        self.component_budget_ratio = getattr(training_args, "component_budget_ratio", 0.01)
+        self.component_max_anchor_ratio = getattr(training_args, "component_max_anchor_ratio", 2.80)
+        self.component_min_views = getattr(training_args, "component_min_views", 2)
+        self.component_visit_threshold_scale = getattr(training_args, "component_visit_threshold_scale", 0.25)
+        self.component_proposal_level = getattr(training_args, "component_proposal_level", 0)
+        self.component_candidate_max_per_interval = getattr(training_args, "component_candidate_max_per_interval", 512)
+        self.initial_anchor_count = self.get_anchor.shape[0]
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
@@ -300,6 +328,14 @@ class GaussianModel:
         self.offset_error_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_error_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
         self.anchor_error_denom = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.offset_component_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
+        self.offset_component_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
+        self.offset_component_proposal_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
+        self.offset_component_proposal_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
+        self.anchor_component_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.anchor_component_denom = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.anchor_component_views = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.component_candidate_xyz = torch.empty((0, 3), device="cuda")
 
         
         
@@ -527,7 +563,10 @@ class GaussianModel:
 
     # statis grad information to guide liftting. 
     def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask,
-                        neural_errors=None, neural_error_filter=None, neural_offset_indices=None, neural_anchor_indices=None):
+                        neural_errors=None, neural_error_filter=None, neural_offset_indices=None, neural_anchor_indices=None,
+                        component_scores=None, component_score_filter=None,
+                        component_proposal_scores=None, component_proposal_filter=None,
+                        component_candidate_xyz=None):
         # update opacity stats
         temp_opacity = opacity.clone().view(-1).detach()
         temp_opacity[temp_opacity<0] = 0
@@ -560,6 +599,47 @@ class GaussianModel:
                 self.offset_error_denom.scatter_add_(0, offset_indices, ones)
                 self.anchor_error_accum.scatter_add_(0, anchor_indices, error_values)
                 self.anchor_error_denom.scatter_add_(0, anchor_indices, ones)
+
+        if self.use_component_refinement and component_scores is not None and neural_offset_indices is not None and neural_anchor_indices is not None:
+            component_filter = update_filter if component_score_filter is None else torch.logical_and(update_filter, component_score_filter)
+            if component_filter.sum() > 0:
+                component_values = component_scores[component_filter].detach().view(-1, 1)
+                positive_component = component_values.squeeze(1) > 0
+                if positive_component.sum() > 0:
+                    component_values = component_values[positive_component]
+                    offset_indices = neural_offset_indices[component_filter][positive_component].detach().long().view(-1, 1)
+                    anchor_indices = neural_anchor_indices[component_filter][positive_component].detach().long().view(-1, 1)
+                    ones = torch.ones_like(component_values)
+                    self.offset_component_accum.scatter_add_(0, offset_indices, component_values)
+                    self.offset_component_denom.scatter_add_(0, offset_indices, ones)
+                    self.anchor_component_accum.scatter_add_(0, anchor_indices, component_values)
+                    self.anchor_component_denom.scatter_add_(0, anchor_indices, ones)
+                    unique_anchor_indices = torch.unique(anchor_indices.view(-1)).view(-1, 1)
+                    unique_ones = torch.ones_like(unique_anchor_indices, dtype=self.anchor_component_views.dtype)
+                    self.anchor_component_views.scatter_add_(0, unique_anchor_indices, unique_ones)
+
+        if self.use_component_refinement and self.component_proposal_level >= 1 and component_proposal_scores is not None and neural_offset_indices is not None:
+            proposal_filter = update_filter if component_proposal_filter is None else torch.logical_and(update_filter, component_proposal_filter)
+            if proposal_filter.sum() > 0:
+                proposal_values = component_proposal_scores[proposal_filter].detach().view(-1, 1)
+                positive_proposal = proposal_values.squeeze(1) > 0
+                if positive_proposal.sum() > 0:
+                    proposal_values = proposal_values[positive_proposal]
+                    offset_indices = neural_offset_indices[proposal_filter][positive_proposal].detach().long().view(-1, 1)
+                    ones = torch.ones_like(proposal_values)
+                    self.offset_component_proposal_accum.scatter_add_(0, offset_indices, proposal_values)
+                    self.offset_component_proposal_denom.scatter_add_(0, offset_indices, ones)
+
+        if self.use_component_refinement and self.component_proposal_level >= 2 and component_candidate_xyz is not None and component_candidate_xyz.numel() > 0:
+            candidate_xyz = component_candidate_xyz.detach().view(-1, 3)
+            if self.component_candidate_xyz.numel() == 0:
+                self.component_candidate_xyz = candidate_xyz
+            else:
+                self.component_candidate_xyz = torch.cat([self.component_candidate_xyz, candidate_xyz], dim=0)
+            max_candidates = max(1, int(self.component_candidate_max_per_interval) * 4)
+            if self.component_candidate_xyz.shape[0] > max_candidates:
+                keep = torch.randperm(self.component_candidate_xyz.shape[0], device=self.component_candidate_xyz.device)[:max_candidates]
+                self.component_candidate_xyz = self.component_candidate_xyz[keep]
 
         
 
@@ -612,10 +692,13 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
     
-    def anchor_growing(self, grads, threshold, offset_mask):
+    def anchor_growing(self, grads, threshold, offset_mask, max_new_anchors=None):
         ## 
         init_length = self.get_anchor.shape[0]*self.n_offsets
+        total_added = 0
         for i in range(self.update_depth):
+            if max_new_anchors is not None and total_added >= max_new_anchors:
+                break
             # update threshold
             cur_threshold = threshold*((self.update_hierachy_factor//2)**i)
             # mask from grad threshold
@@ -679,6 +762,18 @@ class GaussianModel:
 
                 new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
 
+                if max_new_anchors is not None:
+                    remaining = max_new_anchors - total_added
+                    if remaining <= 0:
+                        continue
+                    if candidate_anchor.shape[0] > remaining:
+                        keep_indices = torch.randperm(candidate_anchor.shape[0], device=candidate_anchor.device)[:remaining]
+                        candidate_anchor = candidate_anchor[keep_indices]
+                        new_scaling = new_scaling[keep_indices]
+                        new_rotation = new_rotation[keep_indices]
+                        new_opacities = new_opacities[keep_indices]
+                        new_feat = new_feat[keep_indices]
+
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
 
                 d = {
@@ -708,7 +803,79 @@ class GaussianModel:
                 self._anchor_feat = optimizable_tensors["anchor_feat"]
                 self._offset = optimizable_tensors["offset"]
                 self._opacity = optimizable_tensors["opacity"]
+                total_added += candidate_anchor.shape[0]
                 
+        return total_added
+
+
+    def add_component_candidate_anchors(self, candidate_xyz, max_new_anchors=None):
+        if candidate_xyz is None or candidate_xyz.numel() == 0:
+            return 0
+        if max_new_anchors is not None and max_new_anchors <= 0:
+            return 0
+
+        finest_factor = max(self.update_init_factor // (self.update_hierachy_factor ** max(self.update_depth - 1, 0)), 1)
+        cur_size = self.voxel_size * finest_factor
+        candidate_grid = torch.round(candidate_xyz.detach() / cur_size).int()
+        candidate_grid_unique = torch.unique(candidate_grid, dim=0)
+        if candidate_grid_unique.shape[0] == 0:
+            return 0
+
+        grid_coords = torch.round(self.get_anchor / cur_size).int()
+        chunk_size = 4096
+        remove_duplicates_list = []
+        for i in range(grid_coords.shape[0] // chunk_size + (1 if grid_coords.shape[0] % chunk_size != 0 else 0)):
+            cur_remove_duplicates = (candidate_grid_unique.unsqueeze(1) == grid_coords[i * chunk_size:(i + 1) * chunk_size, :]).all(-1).any(-1).view(-1)
+            remove_duplicates_list.append(cur_remove_duplicates)
+        if remove_duplicates_list:
+            remove_duplicates = reduce(torch.logical_or, remove_duplicates_list)
+            candidate_grid_unique = candidate_grid_unique[~remove_duplicates]
+        if candidate_grid_unique.shape[0] == 0:
+            return 0
+
+        if max_new_anchors is not None and candidate_grid_unique.shape[0] > max_new_anchors:
+            keep = torch.randperm(candidate_grid_unique.shape[0], device=candidate_grid_unique.device)[:max_new_anchors]
+            candidate_grid_unique = candidate_grid_unique[keep]
+
+        candidate_anchor = candidate_grid_unique.float() * cur_size
+        nearest_feat = []
+        for start in range(0, candidate_anchor.shape[0], 32):
+            chunk = candidate_anchor[start:start + 32]
+            distances = torch.cdist(chunk, self.get_anchor.detach())
+            nearest = distances.argmin(dim=1)
+            nearest_feat.append(self._anchor_feat.detach()[nearest])
+        new_feat = torch.cat(nearest_feat, dim=0) if nearest_feat else torch.zeros((0, self.feat_dim), device='cuda')
+        if new_feat.shape[0] == 0:
+            return 0
+
+        new_scaling = torch.ones_like(candidate_anchor).repeat([1, 2]).float().cuda() * cur_size
+        new_scaling = torch.log(new_scaling)
+        new_rotation = torch.zeros([candidate_anchor.shape[0], 4], device=candidate_anchor.device).float()
+        new_rotation[:, 0] = 1.0
+        new_opacities = inverse_sigmoid(0.1 * torch.ones((candidate_anchor.shape[0], 1), dtype=torch.float, device='cuda'))
+        new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).float().cuda()
+
+        d = {
+            'anchor': candidate_anchor,
+            'scaling': new_scaling,
+            'rotation': new_rotation,
+            'anchor_feat': new_feat,
+            'offset': new_offsets,
+            'opacity': new_opacities,
+        }
+
+        self.anchor_demon = torch.cat([self.anchor_demon, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
+        self.opacity_accum = torch.cat([self.opacity_accum, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
+        torch.cuda.empty_cache()
+
+        optimizable_tensors = self.cat_tensors_to_optimizer(d)
+        self._anchor = optimizable_tensors['anchor']
+        self._scaling = optimizable_tensors['scaling']
+        self._rotation = optimizable_tensors['rotation']
+        self._anchor_feat = optimizable_tensors['anchor_feat']
+        self._offset = optimizable_tensors['offset']
+        self._opacity = optimizable_tensors['opacity']
+        return candidate_anchor.shape[0]
 
 
     def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
@@ -717,6 +884,8 @@ class GaussianModel:
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
         visit_threshold_scale = self.error_visit_threshold_scale if self.use_error_aware_refinement else 0.5
+        if self.use_component_refinement:
+            visit_threshold_scale = min(visit_threshold_scale, self.component_visit_threshold_scale)
         offset_mask = (self.offset_denom > check_interval * success_threshold * visit_threshold_scale).squeeze(dim=1)
 
         grow_scores = grads_norm
@@ -729,8 +898,47 @@ class GaussianModel:
                 multiplicative_score = grads_norm * (1.0 + self.error_grow_weight * error_norm)
                 additive_score = grad_threshold * self.error_score_add_weight * error_norm
                 grow_scores = multiplicative_score + additive_score
+
+        reliable_component_count = 0
+        proposal_component_count = 0
+        if self.use_component_refinement and self.offset_component_denom.numel() == self.offset_gradient_accum.numel():
+            offset_component_mean = self.offset_component_accum / self.offset_component_denom.clamp_min(1.0)
+            observed_component = (self.offset_component_denom > 0).squeeze(dim=1)
+            reliable_component_count = int(observed_component.sum().item())
+            if observed_component.sum() > 0:
+                mean_component = offset_component_mean[observed_component].mean().clamp_min(1e-6)
+                component_norm = (offset_component_mean.squeeze(dim=1) / mean_component).clamp(max=self.component_norm_clip)
+                anchor_component_views = self.anchor_component_views.repeat_interleave(self.n_offsets, dim=0).squeeze(dim=1)
+                consistent_component = anchor_component_views >= self.component_min_views
+                component_add = grad_threshold * self.component_score_add_weight * component_norm
+                grow_scores = grow_scores + component_add * consistent_component.float()
+                offset_mask = torch.logical_or(offset_mask, torch.logical_and(consistent_component, observed_component))
+
+        if self.use_component_refinement and self.component_proposal_level >= 1 and self.offset_component_proposal_denom.numel() == self.offset_gradient_accum.numel():
+            proposal_mean = self.offset_component_proposal_accum / self.offset_component_proposal_denom.clamp_min(1.0)
+            observed_proposal = (self.offset_component_proposal_denom > 0).squeeze(dim=1)
+            proposal_component_count = int(observed_proposal.sum().item())
+            if observed_proposal.sum() > 0:
+                mean_proposal = proposal_mean[observed_proposal].mean().clamp_min(1e-6)
+                proposal_norm = (proposal_mean.squeeze(dim=1) / mean_proposal).clamp(max=self.component_norm_clip)
+                proposal_add = grad_threshold * self.component_score_add_weight * proposal_norm
+                grow_scores = grow_scores + proposal_add
+                offset_mask = torch.logical_or(offset_mask, observed_proposal)
+
+        max_new_anchors = None
+        if self.use_component_refinement and self.component_budget_ratio > 0:
+            max_total_anchors = max(self.get_anchor.shape[0], int(self.initial_anchor_count * self.component_max_anchor_ratio))
+            remaining_budget = max_total_anchors - self.get_anchor.shape[0]
+            interval_budget = max(1, int(self.get_anchor.shape[0] * self.component_budget_ratio))
+            max_new_anchors = max(0, min(interval_budget, remaining_budget))
         
-        self.anchor_growing(grow_scores, grad_threshold, offset_mask)
+        added_from_growth = self.anchor_growing(grow_scores, grad_threshold, offset_mask, max_new_anchors=max_new_anchors)
+        added_from_candidates = 0
+        if self.use_component_refinement and self.component_proposal_level >= 2 and self.component_candidate_xyz.numel() > 0:
+            candidate_budget = int(self.component_candidate_max_per_interval)
+            if max_new_anchors is not None:
+                candidate_budget = min(candidate_budget, max(0, max_new_anchors - added_from_growth))
+            added_from_candidates = self.add_component_candidate_anchors(self.component_candidate_xyz, max_new_anchors=candidate_budget)
 
         if self.use_error_aware_refinement:
             self.offset_error_accum[offset_mask] = 0
@@ -751,6 +959,43 @@ class GaussianModel:
                                                      dtype=self.anchor_error_denom.dtype,
                                                      device=self.anchor_error_denom.device)
             self.anchor_error_denom = torch.cat([self.anchor_error_denom, padding_anchor_error_denom], dim=0)
+
+        if self.use_component_refinement:
+            self.offset_component_accum[offset_mask] = 0
+            self.offset_component_denom[offset_mask] = 0
+            padding_offset_component = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_component_accum.shape[0], 1],
+                                                   dtype=self.offset_component_accum.dtype,
+                                                   device=self.offset_component_accum.device)
+            self.offset_component_accum = torch.cat([self.offset_component_accum, padding_offset_component], dim=0)
+            padding_offset_component_denom = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_component_denom.shape[0], 1],
+                                                         dtype=self.offset_component_denom.dtype,
+                                                         device=self.offset_component_denom.device)
+            self.offset_component_denom = torch.cat([self.offset_component_denom, padding_offset_component_denom], dim=0)
+            self.offset_component_proposal_accum[offset_mask] = 0
+            self.offset_component_proposal_denom[offset_mask] = 0
+            padding_offset_component_proposal = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_component_proposal_accum.shape[0], 1],
+                                                            dtype=self.offset_component_proposal_accum.dtype,
+                                                            device=self.offset_component_proposal_accum.device)
+            self.offset_component_proposal_accum = torch.cat([self.offset_component_proposal_accum, padding_offset_component_proposal], dim=0)
+            padding_offset_component_proposal_denom = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_component_proposal_denom.shape[0], 1],
+                                                                  dtype=self.offset_component_proposal_denom.dtype,
+                                                                  device=self.offset_component_proposal_denom.device)
+            self.offset_component_proposal_denom = torch.cat([self.offset_component_proposal_denom, padding_offset_component_proposal_denom], dim=0)
+            padding_anchor_component = torch.zeros([self.get_anchor.shape[0] - self.anchor_component_accum.shape[0], 1],
+                                                   dtype=self.anchor_component_accum.dtype,
+                                                   device=self.anchor_component_accum.device)
+            self.anchor_component_accum = torch.cat([self.anchor_component_accum, padding_anchor_component], dim=0)
+            padding_anchor_component_denom = torch.zeros([self.get_anchor.shape[0] - self.anchor_component_denom.shape[0], 1],
+                                                         dtype=self.anchor_component_denom.dtype,
+                                                         device=self.anchor_component_denom.device)
+            self.anchor_component_denom = torch.cat([self.anchor_component_denom, padding_anchor_component_denom], dim=0)
+            padding_anchor_component_views = torch.zeros([self.get_anchor.shape[0] - self.anchor_component_views.shape[0], 1],
+                                                         dtype=self.anchor_component_views.dtype,
+                                                         device=self.anchor_component_views.device)
+            self.anchor_component_views = torch.cat([self.anchor_component_views, padding_anchor_component_views], dim=0)
+            self.component_candidate_xyz = torch.empty((0, 3), device="cuda")
+            if self.component_proposal_level > 0:
+                print(f"[component] level={self.component_proposal_level} reliable_offsets={reliable_component_count} proposal_offsets={proposal_component_count} growth_added={added_from_growth} candidate_added={added_from_candidates} anchors={self.get_anchor.shape[0]}")
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0
@@ -777,6 +1022,17 @@ class GaussianModel:
                 mean_anchor_error = anchor_error_mean[observed_anchor_error].mean().clamp_min(1e-6)
                 high_error_anchor = anchor_error_mean.squeeze(dim=1) > mean_anchor_error * self.error_prune_keep_ratio
                 prune_mask = torch.logical_and(prune_mask, ~high_error_anchor)
+
+        if self.use_component_refinement and self.anchor_component_denom.numel() == self.opacity_accum.numel():
+            anchor_component_mean = self.anchor_component_accum / self.anchor_component_denom.clamp_min(1.0)
+            observed_anchor_component = (self.anchor_component_denom > 0).squeeze(dim=1)
+            if observed_anchor_component.sum() > 0:
+                mean_anchor_component = anchor_component_mean[observed_anchor_component].mean().clamp_min(1e-6)
+                high_component_anchor = torch.logical_and(
+                    anchor_component_mean.squeeze(dim=1) > mean_anchor_component,
+                    self.anchor_component_views.squeeze(dim=1) >= self.component_min_views,
+                )
+                prune_mask = torch.logical_and(prune_mask, ~high_component_anchor)
         
         # update offset_denom
         offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
@@ -798,6 +1054,24 @@ class GaussianModel:
             del self.offset_error_denom
             self.offset_error_accum = offset_error_accum
             self.offset_error_denom = offset_error_denom
+
+        if self.use_component_refinement:
+            offset_component_accum = self.offset_component_accum.view([-1, self.n_offsets])[~prune_mask]
+            offset_component_accum = offset_component_accum.view([-1, 1])
+            offset_component_denom = self.offset_component_denom.view([-1, self.n_offsets])[~prune_mask]
+            offset_component_denom = offset_component_denom.view([-1, 1])
+            offset_component_proposal_accum = self.offset_component_proposal_accum.view([-1, self.n_offsets])[~prune_mask]
+            offset_component_proposal_accum = offset_component_proposal_accum.view([-1, 1])
+            offset_component_proposal_denom = self.offset_component_proposal_denom.view([-1, self.n_offsets])[~prune_mask]
+            offset_component_proposal_denom = offset_component_proposal_denom.view([-1, 1])
+            del self.offset_component_accum
+            del self.offset_component_denom
+            del self.offset_component_proposal_accum
+            del self.offset_component_proposal_denom
+            self.offset_component_accum = offset_component_accum
+            self.offset_component_denom = offset_component_denom
+            self.offset_component_proposal_accum = offset_component_proposal_accum
+            self.offset_component_proposal_denom = offset_component_proposal_denom
         
         # update opacity accum 
         if anchors_mask.sum()>0:
@@ -806,6 +1080,10 @@ class GaussianModel:
             if self.use_error_aware_refinement:
                 self.anchor_error_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
                 self.anchor_error_denom[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
+            if self.use_component_refinement:
+                self.anchor_component_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
+                self.anchor_component_denom[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
+                self.anchor_component_views[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
         
         temp_opacity_accum = self.opacity_accum[~prune_mask]
         del self.opacity_accum
@@ -822,6 +1100,17 @@ class GaussianModel:
             del self.anchor_error_denom
             self.anchor_error_accum = temp_anchor_error_accum
             self.anchor_error_denom = temp_anchor_error_denom
+
+        if self.use_component_refinement:
+            temp_anchor_component_accum = self.anchor_component_accum[~prune_mask]
+            temp_anchor_component_denom = self.anchor_component_denom[~prune_mask]
+            temp_anchor_component_views = self.anchor_component_views[~prune_mask]
+            del self.anchor_component_accum
+            del self.anchor_component_denom
+            del self.anchor_component_views
+            self.anchor_component_accum = temp_anchor_component_accum
+            self.anchor_component_denom = temp_anchor_component_denom
+            self.anchor_component_views = temp_anchor_component_views
 
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)

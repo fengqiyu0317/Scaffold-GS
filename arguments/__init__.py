@@ -173,6 +173,39 @@ class OptimizationParams(ParamGroup):
         self.error_score_add_weight = 0.25
         self.error_visit_threshold_scale = 0.35
 
+        # Optional component-aware refinement for small highlights and thin
+        # bright structures. Disabled by default.
+        self.use_component_refinement = False
+        self.component_refine_start = 1500
+        self.component_refine_until = 15000
+        self.component_loss_weight = 0.10
+        self.highlight_deficit_weight = 0.08
+        self.vertical_edge_weight = 0.04
+        self.component_highlight_threshold = 0.62
+        self.component_deficit_threshold = 0.03
+        self.component_local_contrast_threshold = 0.08
+        self.component_white_luma_threshold = 0.58
+        self.component_white_saturation_threshold = 0.28
+        self.component_line_kernel = 21
+        self.component_dot_kernel = 9
+        self.component_score_add_weight = 0.35
+        self.component_norm_clip = 4.0
+        self.component_budget_ratio = 0.01
+        self.component_max_anchor_ratio = 2.80
+        self.component_min_views = 2
+        self.component_visit_threshold_scale = 0.25
+        self.component_proposal_level = 0
+        self.component_attribution_radius_px = 4.0
+        self.component_attribution_min_opacity = 0.01
+        self.component_attribution_depth_rel_band = 0.15
+        self.component_attribution_depth_abs_band = 0.05
+        self.component_loose_radius_px = 12.0
+        self.component_loose_depth_rel_band = 0.45
+        self.component_proposal_max_points = 256
+        self.component_proposal_nms_kernel = 9
+        self.component_ray_depth_samples = 3
+        self.component_candidate_max_per_interval = 512
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
