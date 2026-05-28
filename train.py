@@ -145,6 +145,94 @@ def build_refinement_error_map(image, gt_image, opt):
     return error_4d.squeeze(0).squeeze(0)
 
 
+def compute_luma(image):
+    coeff = image.new_tensor([0.299, 0.587, 0.114]).view(3, 1, 1)
+    return (image * coeff).sum(dim=0, keepdim=True)
+
+
+def sobel_luma_edges(luma):
+    sobel_x = luma.new_tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]).view(1, 1, 3, 3) / 4.0
+    sobel_y = luma.new_tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]]).view(1, 1, 3, 3) / 4.0
+    luma_4d = luma.unsqueeze(0)
+    return F.conv2d(luma_4d, sobel_x, padding=1).squeeze(0), F.conv2d(luma_4d, sobel_y, padding=1).squeeze(0)
+
+
+def build_component_refinement_maps(image, gt_image, opt):
+    image_detached = image.detach().clamp(0.0, 1.0)
+    gt_detached = gt_image.detach().clamp(0.0, 1.0)
+    pred_luma = compute_luma(image_detached)
+    gt_luma = compute_luma(gt_detached)
+    deficit = torch.relu(gt_luma - pred_luma)
+
+    dot_kernel = max(3, int(getattr(opt, "component_dot_kernel", 9)))
+    line_kernel = max(5, int(getattr(opt, "component_line_kernel", 21)))
+    if dot_kernel % 2 == 0:
+        dot_kernel += 1
+    if line_kernel % 2 == 0:
+        line_kernel += 1
+
+    local_mean = F.avg_pool2d(gt_luma.unsqueeze(0), kernel_size=dot_kernel, stride=1, padding=dot_kernel // 2).squeeze(0)
+    local_contrast = torch.relu(gt_luma - local_mean)
+    highlight_seed = (gt_luma > getattr(opt, "component_highlight_threshold", 0.62)).float()
+    deficit_seed = (deficit > getattr(opt, "component_deficit_threshold", 0.03)).float()
+    contrast_seed = (local_contrast > getattr(opt, "component_local_contrast_threshold", 0.08)).float()
+    bright_density = F.avg_pool2d(highlight_seed.unsqueeze(0), kernel_size=dot_kernel, stride=1, padding=dot_kernel // 2).squeeze(0)
+    small_highlight = highlight_seed * deficit_seed * contrast_seed * (bright_density < 0.45).float()
+    small_highlight = F.max_pool2d(small_highlight.unsqueeze(0), kernel_size=3, stride=1, padding=1).squeeze(0)
+
+    rgb_max = gt_detached.max(dim=0, keepdim=True)[0]
+    rgb_min = gt_detached.min(dim=0, keepdim=True)[0]
+    saturation = rgb_max - rgb_min
+    white_seed = ((gt_luma > getattr(opt, "component_white_luma_threshold", 0.58)) &
+                  (saturation < getattr(opt, "component_white_saturation_threshold", 0.28))).float()
+    vertical_context = F.max_pool2d(white_seed.unsqueeze(0), kernel_size=(line_kernel, 3), stride=1, padding=(line_kernel // 2, 1)).squeeze(0)
+    horizontal_context = F.max_pool2d(white_seed.unsqueeze(0), kernel_size=(3, line_kernel), stride=1, padding=(1, line_kernel // 2)).squeeze(0)
+    gt_grad_x, _ = sobel_luma_edges(gt_luma)
+    vertical_edge_seed = (gt_grad_x.abs() > gt_grad_x.abs().mean().clamp_min(1e-6) * 1.5).float()
+    thin_vertical = white_seed * vertical_context * (1.0 - 0.5 * horizontal_context).clamp(0.0, 1.0)
+    thin_vertical = torch.maximum(thin_vertical, white_seed * vertical_edge_seed)
+    thin_vertical = F.max_pool2d(thin_vertical.unsqueeze(0), kernel_size=(line_kernel, 3), stride=1, padding=(line_kernel // 2, 1)).squeeze(0)
+
+    component_mask = torch.maximum(small_highlight, thin_vertical).detach().clamp(0.0, 1.0)
+    highlight_mask = small_highlight.detach().clamp(0.0, 1.0)
+    vertical_mask = thin_vertical.detach().clamp(0.0, 1.0)
+    component_map = torch.maximum(component_mask * torch.maximum(deficit, local_contrast), vertical_mask * (deficit + gt_grad_x.abs())).detach()
+    return component_mask, highlight_mask, vertical_mask, component_map.squeeze(0)
+
+
+def masked_mean(value, mask):
+    denom = mask.sum().clamp_min(1.0)
+    return (value * mask).sum() / denom
+
+
+def component_refinement_loss(image, gt_image, opt):
+    component_mask, highlight_mask, vertical_mask, _ = build_component_refinement_maps(image, gt_image, opt)
+    if component_mask.sum() <= 0:
+        return image.new_tensor(0.0), component_mask, highlight_mask, vertical_mask
+
+    pred_luma = compute_luma(image.clamp(0.0, 1.0))
+    gt_luma = compute_luma(gt_image.clamp(0.0, 1.0))
+    l1_map = torch.abs(image - gt_image).mean(dim=0, keepdim=True)
+    component_loss = masked_mean(l1_map, component_mask)
+
+    if highlight_mask.sum() > 0:
+        highlight_deficit = masked_mean(torch.relu(gt_luma - pred_luma), highlight_mask)
+    else:
+        highlight_deficit = image.new_tensor(0.0)
+
+    if vertical_mask.sum() > 0:
+        pred_grad_x, _ = sobel_luma_edges(pred_luma)
+        gt_grad_x, _ = sobel_luma_edges(gt_luma)
+        vertical_edge_loss = masked_mean(torch.abs(pred_grad_x - gt_grad_x), vertical_mask)
+    else:
+        vertical_edge_loss = image.new_tensor(0.0)
+
+    loss = (getattr(opt, "component_loss_weight", 0.10) * component_loss +
+            getattr(opt, "highlight_deficit_weight", 0.08) * highlight_deficit +
+            getattr(opt, "vertical_edge_weight", 0.04) * vertical_edge_loss)
+    return loss, component_mask, highlight_mask, vertical_mask
+
+
 def sample_neural_gaussian_errors(viewpoint_camera, neural_xyz, visibility_filter, error_map, opt=None):
     if neural_xyz.numel() == 0:
         empty_errors = torch.zeros((0, 1), dtype=error_map.dtype, device=error_map.device)
@@ -195,6 +283,202 @@ def sample_neural_gaussian_errors(viewpoint_camera, neural_xyz, visibility_filte
         valid_mask[target_indices] = True
 
     return errors, valid_mask
+
+
+def project_points_to_image(viewpoint_camera, xyz):
+    if xyz.numel() == 0:
+        empty_grid = torch.zeros((0, 2), dtype=xyz.dtype, device=xyz.device)
+        empty_xy = torch.zeros((0, 2), dtype=xyz.dtype, device=xyz.device)
+        empty_depth = torch.zeros((0,), dtype=xyz.dtype, device=xyz.device)
+        empty_mask = torch.zeros((0,), dtype=torch.bool, device=xyz.device)
+        return empty_grid, empty_xy, empty_depth, empty_mask
+
+    ones = torch.ones((xyz.shape[0], 1), dtype=xyz.dtype, device=xyz.device)
+    xyz_hom = torch.cat([xyz, ones], dim=1)
+    projected = torch.matmul(xyz_hom, viewpoint_camera.full_proj_transform)
+    denom = projected[:, 3].abs().clamp_min(1e-7)
+    ndc = projected[:, :3] / denom.unsqueeze(1)
+    grid = torch.stack([ndc[:, 0], -ndc[:, 1]], dim=-1)
+    in_image = (grid[:, 0] >= -1.0) & (grid[:, 0] <= 1.0) & (grid[:, 1] >= -1.0) & (grid[:, 1] <= 1.0)
+
+    width = float(viewpoint_camera.image_width)
+    height = float(viewpoint_camera.image_height)
+    pixel_xy = torch.stack([
+        (grid[:, 0] + 1.0) * 0.5 * max(width - 1.0, 1.0),
+        (grid[:, 1] + 1.0) * 0.5 * max(height - 1.0, 1.0),
+    ], dim=-1)
+
+    view_xyz = torch.matmul(xyz_hom, viewpoint_camera.world_view_transform)
+    depth = view_xyz[:, 2]
+    return grid, pixel_xy, depth, in_image
+
+
+def sample_map_neighborhood(value_map, grid, radius_px=0.0):
+    if grid.numel() == 0:
+        return torch.zeros((0,), dtype=value_map.dtype, device=value_map.device)
+
+    height, width = value_map.shape
+    image = value_map.view(1, 1, height, width)
+    radius_px = float(radius_px)
+    if radius_px <= 0.0:
+        return F.grid_sample(image, grid.view(1, -1, 1, 2), mode='bilinear', padding_mode='zeros', align_corners=True).view(-1)
+
+    dx = 2.0 * radius_px / max(width - 1, 1)
+    dy = 2.0 * radius_px / max(height - 1, 1)
+    offsets = grid.new_tensor([
+        [0.0, 0.0], [dx, 0.0], [-dx, 0.0], [0.0, dy], [0.0, -dy],
+        [dx, dy], [dx, -dy], [-dx, dy], [-dx, -dy],
+    ])
+    sample_grid = (grid.unsqueeze(1) + offsets.unsqueeze(0)).view(1, grid.shape[0], offsets.shape[0], 2)
+    sampled = F.grid_sample(image, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+    return sampled.view(grid.shape[0], offsets.shape[0]).max(dim=1)[0]
+
+
+def build_component_candidate_points(viewpoint_camera, component_map, component_mask, pixel_xy, depth, reliable_filter, loose_filter, opt):
+    if int(getattr(opt, 'component_proposal_level', 0)) < 2:
+        return torch.zeros((0, 3), dtype=component_map.dtype, device=component_map.device)
+
+    mask_2d = component_mask.squeeze(0) if component_mask.dim() == 3 else component_mask
+    score_map = (component_map * (mask_2d > 0).float()).clamp_min(0.0)
+    if score_map.max() <= 0:
+        return torch.zeros((0, 3), dtype=component_map.dtype, device=component_map.device)
+
+    nms_kernel = max(3, int(getattr(opt, 'component_proposal_nms_kernel', 9)))
+    if nms_kernel % 2 == 0:
+        nms_kernel += 1
+    pooled = F.max_pool2d(score_map.view(1, 1, *score_map.shape), kernel_size=nms_kernel, stride=1, padding=nms_kernel // 2).view_as(score_map)
+    positive = score_map > score_map[score_map > 0].mean().clamp_min(1e-8)
+    maxima = (score_map >= pooled) & positive
+    coords_yx = torch.nonzero(maxima, as_tuple=False)
+    if coords_yx.numel() == 0:
+        return torch.zeros((0, 3), dtype=component_map.dtype, device=component_map.device)
+
+    values = score_map[coords_yx[:, 0], coords_yx[:, 1]]
+    max_points = max(1, int(getattr(opt, 'component_proposal_max_points', 256)))
+    if coords_yx.shape[0] > max_points:
+        top_idx = torch.topk(values, k=max_points, largest=True)[1]
+        coords_yx = coords_yx[top_idx]
+
+    candidate_pixels = torch.stack([coords_yx[:, 1].float(), coords_yx[:, 0].float()], dim=1).to(component_map.device)
+    attribution_radius = float(getattr(opt, 'component_attribution_radius_px', 4.0))
+    if reliable_filter is not None and reliable_filter.sum() > 0:
+        reliable_pixels = pixel_xy[reliable_filter]
+        if reliable_pixels.shape[0] > 16384:
+            keep = torch.randperm(reliable_pixels.shape[0], device=reliable_pixels.device)[:16384]
+            reliable_pixels = reliable_pixels[keep]
+        min_dist = torch.full((candidate_pixels.shape[0],), float('inf'), dtype=component_map.dtype, device=component_map.device)
+        for start in range(0, reliable_pixels.shape[0], 4096):
+            dist = torch.cdist(candidate_pixels, reliable_pixels[start:start + 4096])
+            min_dist = torch.minimum(min_dist, dist.min(dim=1)[0])
+        candidate_pixels = candidate_pixels[min_dist > attribution_radius]
+        if candidate_pixels.numel() == 0:
+            return torch.zeros((0, 3), dtype=component_map.dtype, device=component_map.device)
+
+    depth_filter = loose_filter if loose_filter is not None and loose_filter.sum() > 0 else torch.isfinite(depth)
+    depth_pixels = pixel_xy[depth_filter]
+    depth_values = depth[depth_filter]
+    finite = torch.isfinite(depth_values)
+    depth_pixels = depth_pixels[finite]
+    depth_values = depth_values[finite]
+    if depth_values.numel() == 0:
+        return torch.zeros((0, 3), dtype=component_map.dtype, device=component_map.device)
+    if depth_values.shape[0] > 32768:
+        keep = torch.randperm(depth_values.shape[0], device=depth_values.device)[:32768]
+        depth_pixels = depth_pixels[keep]
+        depth_values = depth_values[keep]
+
+    loose_radius = float(getattr(opt, 'component_loose_radius_px', 12.0))
+    ray_samples = max(1, int(getattr(opt, 'component_ray_depth_samples', 3)))
+    width = float(viewpoint_camera.image_width)
+    height = float(viewpoint_camera.image_height)
+    tanfovx = np.tan(float(viewpoint_camera.FoVx) * 0.5)
+    tanfovy = np.tan(float(viewpoint_camera.FoVy) * 0.5)
+    inv_view = torch.inverse(viewpoint_camera.world_view_transform)
+
+    world_points = []
+    for pix in candidate_pixels:
+        distances = torch.norm(depth_pixels - pix.unsqueeze(0), dim=1)
+        nearby_depth = depth_values[distances <= loose_radius]
+        if nearby_depth.numel() == 0:
+            continue
+        nearby_depth = torch.sort(nearby_depth)[0]
+        if ray_samples == 1 or nearby_depth.numel() == 1:
+            sample_depths = nearby_depth[nearby_depth.shape[0] // 2].view(1)
+        else:
+            q = torch.linspace(0.25, 0.75, steps=ray_samples, device=nearby_depth.device)
+            indices = (q * (nearby_depth.shape[0] - 1)).long().clamp(0, nearby_depth.shape[0] - 1)
+            sample_depths = nearby_depth[indices]
+
+        ndc_x = 2.0 * pix[0] / max(width - 1.0, 1.0) - 1.0
+        ndc_y = -(2.0 * pix[1] / max(height - 1.0, 1.0) - 1.0)
+        for d in sample_depths:
+            cam_point = torch.stack([ndc_x * tanfovx * d, ndc_y * tanfovy * d, d, torch.ones_like(d)]).view(1, 4)
+            world_hom = torch.matmul(cam_point, inv_view)
+            world_points.append(world_hom[:, :3] / world_hom[:, 3:].clamp_min(1e-7))
+
+    if not world_points:
+        return torch.zeros((0, 3), dtype=component_map.dtype, device=component_map.device)
+
+    candidates = torch.cat(world_points, dim=0)
+    reproj_grid, _, _, in_image = project_points_to_image(viewpoint_camera, candidates)
+    reproj_score = sample_map_neighborhood(mask_2d, reproj_grid, radius_px=1.0)
+    keep = in_image & (reproj_score > 0.1)
+    return candidates[keep].detach()
+
+
+def analyze_component_refinement(viewpoint_camera, neural_xyz, visibility_filter, selection_mask, neural_opacity, component_map, component_mask, opt):
+    component_scores = torch.zeros((neural_xyz.shape[0], 1), dtype=component_map.dtype, device=component_map.device)
+    component_score_filter = torch.zeros((neural_xyz.shape[0],), dtype=torch.bool, device=component_map.device)
+    proposal_scores = torch.zeros_like(component_scores)
+    proposal_filter = torch.zeros_like(component_score_filter)
+    candidate_xyz = torch.zeros((0, 3), dtype=component_map.dtype, device=component_map.device)
+    if neural_xyz.numel() == 0:
+        return component_scores, component_score_filter, proposal_scores, proposal_filter, candidate_xyz
+
+    grid, pixel_xy, depth, in_image = project_points_to_image(viewpoint_camera, neural_xyz.detach())
+    active = visibility_filter.detach() & in_image
+    attribution_radius = float(getattr(opt, 'component_attribution_radius_px', 4.0))
+    loose_radius = float(getattr(opt, 'component_loose_radius_px', 12.0))
+    center_scores = sample_map_neighborhood(component_map, grid, radius_px=attribution_radius)
+    loose_scores = sample_map_neighborhood(component_map, grid, radius_px=loose_radius)
+
+    if neural_opacity is not None and selection_mask is not None and neural_opacity.numel() == selection_mask.numel():
+        selected_opacity = neural_opacity.detach().view(-1)[selection_mask.detach()].view(-1)
+    else:
+        selected_opacity = torch.ones((neural_xyz.shape[0],), dtype=component_map.dtype, device=component_map.device)
+    if selected_opacity.shape[0] != neural_xyz.shape[0]:
+        selected_opacity = torch.ones((neural_xyz.shape[0],), dtype=component_map.dtype, device=component_map.device)
+
+    positive = active & (center_scores > 0)
+    depth_ok = positive.clone()
+    if positive.sum() > 0:
+        positive_depth = depth[positive]
+        center_depth = positive_depth.median()
+        band = max(float(getattr(opt, 'component_attribution_depth_abs_band', 0.05)), abs(float(center_depth.detach().item())) * float(getattr(opt, 'component_attribution_depth_rel_band', 0.15)))
+        depth_ok = torch.abs(depth - center_depth) <= band
+
+    opacity_ok = selected_opacity > float(getattr(opt, 'component_attribution_min_opacity', 0.01))
+    reliable_filter = positive & depth_ok & opacity_ok
+    component_scores[:, 0] = center_scores
+    component_score_filter = reliable_filter
+
+    proposal_level = int(getattr(opt, 'component_proposal_level', 0))
+    if proposal_level >= 1:
+        loose_positive = active & (loose_scores > 0)
+        loose_depth_ok = loose_positive.clone()
+        if loose_positive.sum() > 0:
+            loose_depth = depth[loose_positive]
+            center_depth = loose_depth.median()
+            band = max(float(getattr(opt, 'component_attribution_depth_abs_band', 0.05)), abs(float(center_depth.detach().item())) * float(getattr(opt, 'component_loose_depth_rel_band', 0.45)))
+            loose_depth_ok = torch.abs(depth - center_depth) <= band
+        proposal_filter = loose_positive & loose_depth_ok & (~reliable_filter)
+        proposal_scores[:, 0] = loose_scores
+
+    candidate_xyz = build_component_candidate_points(
+        viewpoint_camera, component_map, component_mask, pixel_xy, depth,
+        reliable_filter, active & (loose_scores > 0), opt,
+    )
+    return component_scores, component_score_filter, proposal_scores, proposal_filter, candidate_xyz
 
 
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
@@ -258,16 +542,38 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gt_image = viewpoint_cam.original_image.cuda()
         neural_errors = None
         neural_error_filter = None
+        component_scores = None
+        component_score_filter = None
+        component_proposal_scores = None
+        component_proposal_filter = None
+        component_candidate_xyz = None
+        component_active = (getattr(opt, "use_component_refinement", False)
+                            and iteration >= getattr(opt, "component_refine_start", opt.update_from)
+                            and iteration < getattr(opt, "component_refine_until", opt.update_until))
         if opt.use_error_aware_refinement and iteration < opt.update_until and iteration > opt.start_stat:
             error_map = build_refinement_error_map(image, gt_image, opt)
             neural_errors, neural_error_filter = sample_neural_gaussian_errors(
                 viewpoint_cam, render_pkg["neural_xyz"], visibility_filter, error_map, opt
             )
+        component_loss = image.new_tensor(0.0)
+        if component_active and iteration < opt.update_until and iteration > opt.start_stat:
+            component_loss, component_mask, _, _ = component_refinement_loss(image, gt_image, opt)
+            _, _, _, component_map = build_component_refinement_maps(image, gt_image, opt)
+            component_scores, component_score_filter, component_proposal_scores, component_proposal_filter, component_candidate_xyz = analyze_component_refinement(
+                viewpoint_cam,
+                render_pkg["neural_xyz"],
+                visibility_filter,
+                offset_selection_mask,
+                render_pkg["neural_opacity"],
+                component_map,
+                component_mask,
+                opt,
+            )
         Ll1 = l1_loss(image, gt_image)
 
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg + component_loss
 
         loss.backward()
         
@@ -298,6 +604,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     neural_error_filter=neural_error_filter,
                     neural_offset_indices=render_pkg.get("neural_offset_indices", None),
                     neural_anchor_indices=render_pkg.get("neural_anchor_indices", None),
+                    component_scores=component_scores,
+                    component_score_filter=component_score_filter,
+                    component_proposal_scores=component_proposal_scores,
+                    component_proposal_filter=component_proposal_filter,
+                    component_candidate_xyz=component_candidate_xyz,
                 )
                 
                 # densification
@@ -312,6 +623,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     del gaussians.offset_error_denom
                     del gaussians.anchor_error_accum
                     del gaussians.anchor_error_denom
+                if getattr(gaussians, "use_component_refinement", False):
+                    del gaussians.offset_component_accum
+                    del gaussians.offset_component_denom
+                    del gaussians.anchor_component_accum
+                    del gaussians.anchor_component_denom
+                    del gaussians.anchor_component_views
+                    del gaussians.offset_component_proposal_accum
+                    del gaussians.offset_component_proposal_denom
+                    gaussians.component_candidate_xyz = torch.empty((0, 3), device="cuda")
                 torch.cuda.empty_cache()
                     
             # Optimizer step
