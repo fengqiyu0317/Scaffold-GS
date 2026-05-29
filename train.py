@@ -486,7 +486,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist,
-                              dataset.use_viewdist_pe, dataset.view_pe_freqs, dataset.dist_pe_freqs, dataset.pe_include_input)
+                              dataset.use_viewdist_pe, dataset.view_pe_freqs, dataset.dist_pe_freqs,
+                              dataset.use_color_view_pe, dataset.color_view_pe_freqs, dataset.pe_include_input)
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -782,7 +783,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
     with torch.no_grad():
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist,
-                              dataset.use_viewdist_pe, dataset.view_pe_freqs, dataset.dist_pe_freqs, dataset.pe_include_input)
+                              dataset.use_viewdist_pe, dataset.view_pe_freqs, dataset.dist_pe_freqs,
+                              dataset.use_color_view_pe, dataset.color_view_pe_freqs, dataset.pe_include_input)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
 

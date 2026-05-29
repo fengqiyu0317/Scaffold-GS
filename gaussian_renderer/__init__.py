@@ -34,6 +34,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     ob_view = ob_view / ob_dist
     ob_view_encoded = pc.encode_view(ob_view)
     ob_dist_encoded = pc.encode_dist(ob_dist)
+    color_view_encoded = pc.encode_color_view(ob_view)
 
     ## view-adaptive feature
     if pc.use_feat_bank:
@@ -51,6 +52,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     cat_local_view = torch.cat([feat, ob_view_encoded, ob_dist_encoded], dim=1)
     cat_local_view_wodist = torch.cat([feat, ob_view_encoded], dim=1)
+    cat_color_view = torch.cat([feat, color_view_encoded, ob_dist_encoded], dim=1)
+    cat_color_view_wodist = torch.cat([feat, color_view_encoded], dim=1)
     if pc.appearance_dim > 0:
         camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * viewpoint_camera.uid
         # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 10
@@ -80,14 +83,14 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # get offset's color
     if pc.appearance_dim > 0:
         if pc.add_color_dist:
-            color = pc.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1))
+            color = pc.get_color_mlp(torch.cat([cat_color_view, appearance], dim=1))
         else:
-            color = pc.get_color_mlp(torch.cat([cat_local_view_wodist, appearance], dim=1))
+            color = pc.get_color_mlp(torch.cat([cat_color_view_wodist, appearance], dim=1))
     else:
         if pc.add_color_dist:
-            color = pc.get_color_mlp(cat_local_view)
+            color = pc.get_color_mlp(cat_color_view)
         else:
-            color = pc.get_color_mlp(cat_local_view_wodist)
+            color = pc.get_color_mlp(cat_color_view_wodist)
     color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])# [mask]
 
     # get offset's cov

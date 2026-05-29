@@ -44,15 +44,19 @@ class GaussianModel:
 
         self.rotation_activation = torch.nn.functional.normalize
 
-    def _encoded_dim(self, input_dim, num_freqs):
-        if not self.use_viewdist_pe:
+    def _encoded_dim(self, input_dim, num_freqs, enabled=None):
+        if enabled is None:
+            enabled = self.use_viewdist_pe
+        if not enabled:
             return input_dim
         encoded_dim = input_dim if self.pe_include_input else 0
         encoded_dim += 2 * input_dim * max(0, int(num_freqs))
         return encoded_dim
 
-    def _positional_encoding(self, values, num_freqs, include_input=True):
-        if not self.use_viewdist_pe:
+    def _positional_encoding(self, values, num_freqs, include_input=True, enabled=None):
+        if enabled is None:
+            enabled = self.use_viewdist_pe
+        if not enabled:
             return values
 
         encoded = []
@@ -72,6 +76,11 @@ class GaussianModel:
 
     def encode_view(self, view):
         return self._positional_encoding(view, self.view_pe_freqs, self.pe_include_input)
+
+    def encode_color_view(self, view):
+        if self.use_color_view_pe:
+            return self._positional_encoding(view, self.color_view_pe_freqs, self.pe_include_input, enabled=True)
+        return self.encode_view(view)
 
     def encode_dist(self, dist):
         if not self.use_viewdist_pe:
@@ -97,6 +106,8 @@ class GaussianModel:
                  use_viewdist_pe : bool = False,
                  view_pe_freqs : int = 4,
                  dist_pe_freqs : int = 3,
+                 use_color_view_pe : bool = False,
+                 color_view_pe_freqs : int = 1,
                  pe_include_input : bool = True,
                  ):
 
@@ -117,9 +128,12 @@ class GaussianModel:
         self.use_viewdist_pe = use_viewdist_pe
         self.view_pe_freqs = max(0, int(view_pe_freqs))
         self.dist_pe_freqs = max(0, int(dist_pe_freqs))
+        self.use_color_view_pe = use_color_view_pe
+        self.color_view_pe_freqs = max(0, int(color_view_pe_freqs))
         self.pe_include_input = pe_include_input
         self.view_dim = self._encoded_dim(3, self.view_pe_freqs)
         self.dist_dim = self._encoded_dim(1, self.dist_pe_freqs)
+        self.color_view_dim = self._encoded_dim(3, self.color_view_pe_freqs, enabled=True) if self.use_color_view_pe else self.view_dim
         self.featurebank_input_dim = self.view_dim + self.dist_dim
 
         self._anchor = torch.empty(0)
@@ -197,7 +211,7 @@ class GaussianModel:
 
         self.color_dist_dim = self.dist_dim if self.add_color_dist else 0
         self.mlp_color = nn.Sequential(
-            nn.Linear(feat_dim+self.view_dim+self.color_dist_dim+self.appearance_dim, feat_dim),
+            nn.Linear(feat_dim+self.color_view_dim+self.color_dist_dim+self.appearance_dim, feat_dim),
             nn.ReLU(True),
             nn.Linear(feat_dim, 3*self.n_offsets),
             nn.Sigmoid()
@@ -1179,7 +1193,7 @@ class GaussianModel:
             self.mlp_cov.train()
 
             self.mlp_color.eval()
-            color_mlp = torch.jit.trace(self.mlp_color, (torch.rand(1, self.feat_dim+self.view_dim+self.color_dist_dim+self.appearance_dim).cuda()))
+            color_mlp = torch.jit.trace(self.mlp_color, (torch.rand(1, self.feat_dim+self.color_view_dim+self.color_dist_dim+self.appearance_dim).cuda()))
             color_mlp.save(os.path.join(path, 'color_mlp.pt'))
             self.mlp_color.train()
 
