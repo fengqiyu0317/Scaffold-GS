@@ -70,6 +70,21 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     mask = (neural_opacity>0.0)
     mask = mask.view(-1)
 
+    drop_rate = 0.0
+    if is_training and getattr(pc, "use_drop_gaussian", False):
+        drop_rate = float(getattr(pc, "drop_gaussian_rate", 0.0))
+        drop_rate = min(max(drop_rate, 0.0), 0.95)
+        if drop_rate > 0.0 and mask.any():
+            keep_mask = torch.rand(mask.shape, device=mask.device) >= drop_rate
+            dropped_mask = torch.logical_and(mask, keep_mask)
+            if dropped_mask.any():
+                mask = dropped_mask
+            else:
+                active_indices = torch.nonzero(mask, as_tuple=False).view(-1)
+                forced_index = active_indices[torch.randint(active_indices.shape[0], (1,), device=mask.device)]
+                mask = torch.zeros_like(mask)
+                mask[forced_index] = True
+
     if is_training:
         local_offset_ids = torch.arange(pc.n_offsets, device=anchor.device).unsqueeze(0).repeat(anchor.shape[0], 1)
         neural_anchor_indices_all = visible_anchor_indices.unsqueeze(1).repeat(1, pc.n_offsets).reshape(-1)
@@ -79,6 +94,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     # select opacity 
     opacity = neural_opacity[mask]
+    if is_training and drop_rate > 0.0 and bool(getattr(pc, "drop_compensate_opacity", True)):
+        compensation = 1.0 / max(1e-6, 1.0 - drop_rate)
+        compensation = min(compensation, float(getattr(pc, "drop_opacity_compensation_max", 2.0)))
+        opacity = opacity * compensation
 
     # get offset's color
     if pc.appearance_dim > 0:

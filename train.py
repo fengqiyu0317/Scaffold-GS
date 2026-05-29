@@ -481,6 +481,28 @@ def analyze_component_refinement(viewpoint_camera, neural_xyz, visibility_filter
     return component_scores, component_score_filter, proposal_scores, proposal_filter, candidate_xyz
 
 
+def get_drop_gaussian_rate(opt, iteration):
+    if not getattr(opt, "use_drop_gaussian", False):
+        return 0.0
+
+    max_rate = float(getattr(opt, "drop_max_rate", 0.0))
+    max_rate = min(max(max_rate, 0.0), 0.95)
+    if max_rate <= 0.0:
+        return 0.0
+
+    start_iter = int(getattr(opt, "drop_start_iter", 0))
+    if iteration < start_iter:
+        return 0.0
+
+    schedule = str(getattr(opt, "drop_schedule", "progressive")).lower()
+    if schedule == "constant":
+        return max_rate
+
+    ramp_steps = max(1, int(getattr(opt, "iterations", iteration)) - start_iter)
+    progress = min(max((iteration - start_iter) / ramp_steps, 0.0), 1.0)
+    return max_rate * progress
+
+
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -502,6 +524,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
+        drop_gaussian_rate = get_drop_gaussian_rate(opt, iteration)
+        gaussians.use_drop_gaussian = getattr(opt, "use_drop_gaussian", False)
+        gaussians.drop_gaussian_rate = drop_gaussian_rate
+        gaussians.drop_compensate_opacity = bool(getattr(opt, "drop_compensate_opacity", 1))
+        gaussians.drop_opacity_compensation_max = max(1.0, float(getattr(opt, "drop_opacity_compensation_max", 2.0)))
+
         # network gui not available in scaffold-gs yet
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -586,10 +614,19 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                postfix = {"Loss": f"{ema_loss_for_log:.{7}f}"}
+                if getattr(opt, "use_drop_gaussian", False):
+                    postfix["Drop"] = f"{drop_gaussian_rate:.{3}f}"
+                progress_bar.set_postfix(postfix)
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
+
+            if getattr(opt, "use_drop_gaussian", False):
+                if tb_writer:
+                    tb_writer.add_scalar(f'{dataset_name}/drop_gaussian/rate', drop_gaussian_rate, iteration)
+                if wandb is not None:
+                    wandb.log({"drop_gaussian_rate": drop_gaussian_rate})
 
             # Log and save
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)

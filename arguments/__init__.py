@@ -158,6 +158,16 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
+        # Optional DropGaussian-style structural regularization. This only
+        # masks neural Gaussians during training; evaluation renders all of
+        # them.
+        self.use_drop_gaussian = False
+        self.drop_start_iter = 15000
+        self.drop_max_rate = 0.10
+        self.drop_schedule = "progressive"
+        self.drop_compensate_opacity = 1
+        self.drop_opacity_compensation_max = 2.0
+
         # Optional error-aware anchor refinement. Disabled by default to keep
         # the original Scaffold-GS baseline unchanged.
         self.use_error_aware_refinement = False
