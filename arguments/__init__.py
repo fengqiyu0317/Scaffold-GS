@@ -147,6 +147,10 @@ class OptimizationParams(ParamGroup):
 
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+
+        # Optional loss-side Sobel edge constraint. Disabled by default.
+        self.use_edge_loss = False
+        self.edge_loss_weight = 0.02
         
         # for anchor densification
         self.start_stat = 500
