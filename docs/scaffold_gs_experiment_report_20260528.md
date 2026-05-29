@@ -89,10 +89,12 @@ New CLI arguments:
 --use_viewdist_pe
 --view_pe_freqs
 --dist_pe_freqs
+--use_color_view_pe
+--color_view_pe_freqs
 --pe_include_input
 ```
 
-The encoding can be applied to view direction and distance inputs used by color / opacity / covariance prediction branches. The experiments focus on whether higher input bandwidth helps the view-adaptive MLP recover high-frequency view-dependent details.
+The encoding can be applied to view direction and distance inputs used by color / opacity / covariance prediction branches. The experiments focus on whether higher input bandwidth helps the view-adaptive MLP recover high-frequency view-dependent details. The follow-up color-only PE variant disables distance PE and only expands the color MLP view-direction input, leaving opacity and covariance MLP inputs unchanged.
 
 ## 3. Main Results
 
@@ -109,6 +111,7 @@ The encoding can be applied to view direction and distance inputs used by color 
 | View PE3 + Dist PE1 | `view_pe3_dist_pe1_30000` | 0.8784 | 25.7961 | 0.1497 | 125.15 | 213M | Distance PE hurts |
 | View PE3 + error-aware | `view_pe3_error_aware_30000` | 0.8791695 | 25.7397499 | 0.1450265 | 108.46 | 286M | No complementarity with error-aware |
 | View PE1 | `view_pe1_30000` | 0.8820678 | 25.8654747 | 0.1427840 | 55.49* | 215M | Most stable PE result |
+| Color-only View PE1 | `color_view_pe1_30000_rerun_20260529_1142` | 0.8811409 | 25.8219738 | 0.1443109 | 135.18 | 216M | Stable speed, but quality below baseline |
 | View PE2 | `view_pe2_30000` | 0.8817832 | 25.9161205 | 0.1441791 | 44.17* | 210M | Highest PSNR among view-only PE |
 | View PE2 + Dist PE1 | `view_pe2_dist_pe1_30000` | 0.8808201 | 25.8125973 | 0.1448374 | 130.30 | 170M | Distance PE still degrades view-only result |
 
@@ -124,6 +127,7 @@ The encoding can be applied to view direction and distance inputs used by color 
 | Component level 1 | -0.0107767 | -0.3697776 | +0.0123416 | Loose proposal clearly harmful |
 | Component level 2 light | -0.0067020 | -0.2714786 | +0.0064416 | Candidate proposal not yet effective |
 | View PE1 | +0.0003151 | +0.0557156 | -0.0007038 | Small but consistent gain |
+| Color-only View PE1 | -0.0006118 | +0.0122147 | +0.0008232 | Isolating PE to color MLP restores speed but not quality |
 | View PE2 | +0.0000305 | +0.1063614 | +0.0006913 | PSNR gain with slight LPIPS regression |
 | View PE2 + Dist PE1 | -0.0009326 | +0.0028381 | +0.0013497 | Distance PE removes the view-only benefit |
 
@@ -161,10 +165,11 @@ The early high-frequency PE experiments were negative: `view_pe_freqs=4`, `dist_
 The later low-frequency experiments changed the picture:
 
 - `View PE1` improves all three quality metrics slightly over baseline.
+- `Color-only View PE1` keeps FPS close to baseline, but SSIM and LPIPS are worse than baseline.
 - `View PE2` gives the best PSNR among PE runs, but LPIPS is slightly worse than baseline.
 - `View PE3` is worse than PE1 / PE2.
 
-Therefore the correct conclusion is not that positional encoding is entirely useless. The more accurate conclusion is that low-frequency view-direction encoding can help, but the useful bandwidth is narrow.
+Therefore the correct conclusion is not that positional encoding is entirely useless. The more accurate conclusion is that low-frequency view-direction encoding can help, but the useful bandwidth is narrow. Restricting PE to the color MLP is a useful control experiment: it avoids the large FPS penalty seen in the parallel View PE1 / PE2 measurements, but it does not recover the quality gains of full View PE1.
 
 ### 5.5 Distance PE is not useful in the current branch
 
@@ -197,13 +202,14 @@ By overall full-image quality, the current ranking is:
 3. View PE1
 4. View PE2
 5. Baseline Scaffold-GS
-6. View PE2 + Dist PE1
-7. View PE3
-8. Component level 0
-9. Component level 2 light
-10. Component level 1
+6. Color-only View PE1
+7. View PE2 + Dist PE1
+8. View PE3
+9. Component level 0
+10. Component level 2 light
+11. Component level 1
 
-The best main method remains error-aware anchor refinement. The best PE-only result is View PE1 if balanced quality matters, or View PE2 if PSNR is prioritized.
+The best main method remains error-aware anchor refinement. The best PE-only result is View PE1 if balanced quality matters, or View PE2 if PSNR is prioritized. Color-only View PE1 is mainly a negative control showing that limiting PE to the color MLP is efficient but not enough to improve full-image quality.
 
 ## 8. Recommended Report Framing
 
@@ -212,7 +218,7 @@ For the final course report, present the work as follows:
 - Main positive result: error-aware anchor refinement improves novel-view rendering by using reconstruction error to guide density control.
 - Supporting result: error-weighted loss confirms that hard pixels need stronger optimization signal, but loss weighting alone is less balanced than anchor-level capacity allocation.
 - Negative but informative result: component-aware refinement shows that 2D small-structure cues require reliable 3D attribution; otherwise they can harm density control.
-- PE result: low-frequency view-direction encoding gives small gains, while distance PE and high-frequency PE are not robust.
+- PE result: low-frequency view-direction encoding gives small gains, color-only PE is efficient but not quality-positive, while distance PE and high-frequency PE are not robust.
 
 This framing keeps the project centered on machine-learning modeling rather than low-level CUDA or hardware optimization.
 
