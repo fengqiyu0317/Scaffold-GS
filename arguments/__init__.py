@@ -179,6 +179,25 @@ class OptimizationParams(ParamGroup):
         self.highlight_luma_threshold = 0.65
         self.highlight_local_contrast = 0.08
 
+        # Optional V1.3 dynamic tree capacity. The fixed base/high caps remain
+        # the lower/upper bounds, while persistent subtree signals choose the
+        # effective per-parent cap inside that interval.
+        self.use_dynamic_tree_child_budget = False
+        self.tree_dynamic_child_alpha = 6.0
+        self.tree_dynamic_child_beta = 4.0
+        self.tree_dynamic_child_gamma = 4.0
+        self.tree_dynamic_min_error_count = 16
+        self.tree_dynamic_min_highlight_count = 4
+        self.tree_dynamic_size_ref = 20.0
+
+        # Optional V1.3 lightweight geometry prior for child candidates. This
+        # uses only current anchor-tree distances and never touches rendering.
+        self.use_tree_geometry_prior = False
+        self.tree_geometry_weight = 0.5
+        self.tree_geometry_max_zscore = 2.5
+        self.tree_geometry_hard_factor = 2.0
+        self.tree_geometry_min_children = 3
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

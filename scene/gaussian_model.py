@@ -109,6 +109,20 @@ class GaussianModel:
         self.tree_child_high_cap = 12
         self.tree_nonleaf_prune = False
 
+        self.use_dynamic_tree_child_budget = False
+        self.tree_dynamic_child_alpha = 6.0
+        self.tree_dynamic_child_beta = 4.0
+        self.tree_dynamic_child_gamma = 4.0
+        self.tree_dynamic_min_error_count = 16
+        self.tree_dynamic_min_highlight_count = 4
+        self.tree_dynamic_size_ref = 20.0
+
+        self.use_tree_geometry_prior = False
+        self.tree_geometry_weight = 0.5
+        self.tree_geometry_max_zscore = 2.5
+        self.tree_geometry_hard_factor = 2.0
+        self.tree_geometry_min_children = 3
+
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -447,6 +461,117 @@ class GaussianModel:
             "subtree_size": subtree_size,
         }
 
+    def _compute_effective_child_cap(self, parent_ids, tree_stats):
+        base_cap = int(self.tree_child_base_cap)
+        high_cap = int(self.tree_child_high_cap)
+        if parent_ids.numel() == 0:
+            return torch.empty(0, dtype=torch.int32, device=parent_ids.device)
+
+        if not self.use_dynamic_tree_child_budget:
+            parent_high_error = torch.zeros(parent_ids.shape[0], dtype=torch.bool, device=parent_ids.device)
+            if tree_stats is not None and tree_stats["subtree_error_mean"].numel() == self.anchor_parent.numel():
+                subtree_error = tree_stats["subtree_error_mean"]
+                subtree_visit = tree_stats["subtree_visit_count"]
+                observed = subtree_visit > 0
+                if observed.sum() > 0:
+                    global_error = subtree_error[observed].mean().clamp_min(1e-6)
+                    parent_high_error = subtree_error[parent_ids] > global_error
+            return torch.where(
+                parent_high_error,
+                torch.full_like(parent_ids, high_cap, dtype=torch.int32),
+                torch.full_like(parent_ids, base_cap, dtype=torch.int32),
+            )
+
+        if tree_stats is None or tree_stats["subtree_error_mean"].numel() != self.anchor_parent.numel():
+            return torch.full_like(parent_ids, base_cap, dtype=torch.int32)
+
+        subtree_error = tree_stats["subtree_error_mean"]
+        error_count = tree_stats["subtree_error_count"]
+        error_observed = error_count >= float(self.tree_dynamic_min_error_count)
+        if error_observed.sum() == 0:
+            error_observed = error_count > 0
+
+        error_score = torch.zeros(parent_ids.shape[0], device=parent_ids.device)
+        if error_observed.sum() > 0:
+            global_error = subtree_error[error_observed].mean().clamp_min(1e-6)
+            parent_error_observed = error_observed[parent_ids]
+            parent_error_score = (subtree_error[parent_ids] / global_error - 1.0).clamp_min(0.0)
+            parent_error_score = parent_error_score.clamp(max=float(self.tree_error_norm_clip))
+            error_score = torch.where(parent_error_observed, parent_error_score, error_score)
+
+        highlight_score = torch.zeros(parent_ids.shape[0], device=parent_ids.device)
+        if self.use_highlight_aware_refinement:
+            subtree_highlight = tree_stats["subtree_highlight_error_mean"]
+            highlight_count = tree_stats["subtree_highlight_error_count"]
+            highlight_observed = highlight_count >= float(self.tree_dynamic_min_highlight_count)
+            if highlight_observed.sum() == 0:
+                highlight_observed = highlight_count > 0
+            if highlight_observed.sum() > 0:
+                global_highlight = subtree_highlight[highlight_observed].mean().clamp_min(1e-6)
+                parent_highlight_observed = highlight_observed[parent_ids]
+                parent_highlight_score = (subtree_highlight[parent_ids] / global_highlight - 1.0).clamp_min(0.0)
+                parent_highlight_score = parent_highlight_score.clamp(max=float(self.highlight_error_norm_clip))
+                highlight_score = torch.where(parent_highlight_observed, parent_highlight_score, highlight_score)
+
+        size_ref = max(float(self.tree_dynamic_size_ref), 1.0)
+        subtree_size = tree_stats["subtree_size"][parent_ids].float()
+        size_penalty = (subtree_size / size_ref - 1.0).clamp_min(0.0)
+
+        effective_cap = (
+            float(base_cap)
+            + float(self.tree_dynamic_child_alpha) * error_score
+            + float(self.tree_dynamic_child_beta) * highlight_score
+            - float(self.tree_dynamic_child_gamma) * size_penalty
+        )
+        return effective_cap.round().clamp(min=base_cap, max=high_cap).int()
+
+    def _apply_tree_geometry_prior(self, candidate_anchor, parent_ids, candidate_scores, cur_size):
+        if (not self.use_tree_geometry_prior) or candidate_anchor.numel() == 0:
+            return candidate_scores, torch.ones(candidate_anchor.shape[0], dtype=torch.bool, device=candidate_anchor.device)
+
+        parent_xyz = self.get_anchor[parent_ids].detach()
+        candidate_dist = torch.norm(candidate_anchor.float() - parent_xyz.float(), dim=1)
+        n = self.get_anchor.shape[0]
+        device = candidate_anchor.device
+
+        child_count = torch.zeros(n, dtype=torch.float32, device=device)
+        child_dist_sum = torch.zeros(n, dtype=torch.float32, device=device)
+        child_dist_sq_sum = torch.zeros(n, dtype=torch.float32, device=device)
+
+        child_mask = self.anchor_parent >= 0
+        if child_mask.sum() > 0:
+            child_ids = torch.nonzero(child_mask, as_tuple=False).squeeze(1)
+            direct_parent_ids = self.anchor_parent[child_ids]
+            direct_dist = torch.norm(
+                self.get_anchor[child_ids].detach().float() - self.get_anchor[direct_parent_ids].detach().float(),
+                dim=1,
+            )
+            ones = torch.ones_like(direct_dist)
+            child_count.scatter_add_(0, direct_parent_ids, ones)
+            child_dist_sum.scatter_add_(0, direct_parent_ids, direct_dist)
+            child_dist_sq_sum.scatter_add_(0, direct_parent_ids, direct_dist * direct_dist)
+
+        mean_dist = child_dist_sum / child_count.clamp_min(1.0)
+        var_dist = child_dist_sq_sum / child_count.clamp_min(1.0) - mean_dist * mean_dist
+        std_dist = var_dist.clamp_min(0.0).sqrt()
+
+        parent_child_count = child_count[parent_ids]
+        parent_scale = self.get_scaling[parent_ids, :3].detach().float().mean(dim=1)
+        fallback_limit = torch.maximum(parent_scale, torch.full_like(parent_scale, float(cur_size)))
+        learned_limit = mean_dist[parent_ids] + float(self.tree_geometry_max_zscore) * std_dist[parent_ids]
+        expected_limit = torch.where(
+            parent_child_count >= float(self.tree_geometry_min_children),
+            learned_limit,
+            fallback_limit * float(self.tree_geometry_max_zscore),
+        ).clamp_min(float(cur_size) * 0.25)
+
+        ratio = candidate_dist / expected_limit.clamp_min(1e-6)
+        geometry_keep = ratio <= float(self.tree_geometry_hard_factor)
+        soft_penalty = torch.ones_like(candidate_scores)
+        outside = ratio > 1.0
+        soft_penalty[outside] = 1.0 / (1.0 + float(self.tree_geometry_weight) * (ratio[outside] - 1.0))
+        return candidate_scores * soft_penalty, geometry_keep
+
     def _remap_anchor_tree_after_prune(self, prune_mask):
         self._ensure_anchor_tree()
         valid_points_mask = ~prune_mask
@@ -511,6 +636,18 @@ class GaussianModel:
         self.highlight_grow_weight = getattr(training_args, "highlight_grow_weight", 0.5)
         self.highlight_error_norm_clip = getattr(training_args, "highlight_error_norm_clip", 3.0)
         self.highlight_tree_weight = getattr(training_args, "highlight_tree_weight", 0.5)
+        self.use_dynamic_tree_child_budget = getattr(training_args, "use_dynamic_tree_child_budget", False)
+        self.tree_dynamic_child_alpha = getattr(training_args, "tree_dynamic_child_alpha", 6.0)
+        self.tree_dynamic_child_beta = getattr(training_args, "tree_dynamic_child_beta", 4.0)
+        self.tree_dynamic_child_gamma = getattr(training_args, "tree_dynamic_child_gamma", 4.0)
+        self.tree_dynamic_min_error_count = getattr(training_args, "tree_dynamic_min_error_count", 16)
+        self.tree_dynamic_min_highlight_count = getattr(training_args, "tree_dynamic_min_highlight_count", 4)
+        self.tree_dynamic_size_ref = getattr(training_args, "tree_dynamic_size_ref", 20.0)
+        self.use_tree_geometry_prior = getattr(training_args, "use_tree_geometry_prior", False)
+        self.tree_geometry_weight = getattr(training_args, "tree_geometry_weight", 0.5)
+        self.tree_geometry_max_zscore = getattr(training_args, "tree_geometry_max_zscore", 2.5)
+        self.tree_geometry_hard_factor = getattr(training_args, "tree_geometry_hard_factor", 2.0)
+        self.tree_geometry_min_children = getattr(training_args, "tree_geometry_min_children", 3)
         self._ensure_anchor_tree()
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
@@ -927,25 +1064,11 @@ class GaussianModel:
 
             if self.use_tree_anchor_refinement and candidate_anchor.shape[0] > 0:
                 parent_depth = self.anchor_depth[new_parent].long()
+                candidate_scores, geometry_ok = self._apply_tree_geometry_prior(candidate_anchor, new_parent, candidate_scores, cur_size)
                 depth_ok = parent_depth + 1 <= int(self.tree_max_depth)
-                if tree_stats is not None and tree_stats["subtree_error_mean"].numel() == self.anchor_parent.numel():
-                    subtree_error = tree_stats["subtree_error_mean"]
-                    subtree_visit = tree_stats["subtree_visit_count"]
-                    observed = subtree_visit > 0
-                    if observed.sum() > 0:
-                        global_error = subtree_error[observed].mean().clamp_min(1e-6)
-                        parent_high_error = subtree_error[new_parent] > global_error
-                    else:
-                        parent_high_error = torch.zeros_like(depth_ok)
-                else:
-                    parent_high_error = torch.zeros_like(depth_ok)
-                child_cap = torch.where(
-                    parent_high_error,
-                    torch.full_like(new_parent, int(self.tree_child_high_cap), dtype=torch.int32),
-                    torch.full_like(new_parent, int(self.tree_child_base_cap), dtype=torch.int32),
-                )
+                child_cap = self._compute_effective_child_cap(new_parent, tree_stats)
                 budget_ok = self.anchor_children_count[new_parent] < child_cap
-                keep = torch.logical_and(depth_ok, budget_ok)
+                keep = torch.logical_and(torch.logical_and(depth_ok, budget_ok), geometry_ok)
                 if keep.sum() > 0:
                     final_keep = torch.zeros_like(keep)
                     for parent in torch.unique(new_parent[keep]):
