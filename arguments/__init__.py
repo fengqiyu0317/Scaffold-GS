@@ -159,6 +159,17 @@ class OptimizationParams(ParamGroup):
         self.error_norm_clip = 3.0
         self.error_prune_keep_ratio = 1.0
 
+        # Optional tree-aware refinement. This keeps the renderer unchanged and
+        # uses parent/subtree metadata only during training-time density control.
+        self.use_tree_anchor_refinement = False
+        self.tree_max_depth = 6
+        self.tree_grow_weight = 0.5
+        self.tree_error_norm_clip = 3.0
+        self.tree_error_keep_ratio = 1.0
+        self.tree_child_base_cap = 4
+        self.tree_child_high_cap = 12
+        self.tree_nonleaf_prune = False
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

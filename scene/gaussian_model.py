@@ -16,6 +16,7 @@ from torch_scatter import scatter_max
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
 from torch import nn
 import os
+import json
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
@@ -87,6 +88,18 @@ class GaussianModel:
         self.error_grow_weight = 0.5
         self.error_norm_clip = 3.0
         self.error_prune_keep_ratio = 1.0
+
+        self.anchor_parent = torch.empty(0, dtype=torch.long)
+        self.anchor_depth = torch.empty(0, dtype=torch.int32)
+        self.anchor_children_count = torch.empty(0, dtype=torch.int32)
+        self.use_tree_anchor_refinement = False
+        self.tree_max_depth = 6
+        self.tree_grow_weight = 0.5
+        self.tree_error_norm_clip = 3.0
+        self.tree_error_keep_ratio = 1.0
+        self.tree_child_base_cap = 4
+        self.tree_child_high_cap = 12
+        self.tree_nonleaf_prune = False
 
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
@@ -166,20 +179,53 @@ class GaussianModel:
             self.denom,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
+            self.anchor_parent,
+            self.anchor_depth,
+            self.anchor_children_count,
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._anchor, 
-        self._offset,
-        self._local,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        if len(model_args) == 13:
+            (self._anchor,
+            self._offset,
+            self._local,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale,
+            self.anchor_parent,
+            self.anchor_depth,
+            self.anchor_children_count) = model_args
+        elif len(model_args) == 10:
+            (self._anchor,
+            self._offset,
+            self._local,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale) = model_args
+            self._init_anchor_tree()
+        elif len(model_args) == 11:
+            (self.active_sh_degree,
+            self._anchor,
+            self._offset,
+            self._local,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale) = model_args
+            self._init_anchor_tree()
+        else:
+            raise ValueError(f"Unsupported checkpoint format with {len(model_args)} fields")
         self.training_setup(training_args)
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
@@ -278,6 +324,148 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        self._init_anchor_tree()
+
+
+    def _init_anchor_tree(self):
+        n = self.get_anchor.shape[0]
+        device = self.get_anchor.device if self.get_anchor.numel() > 0 else torch.device("cuda")
+        self.anchor_parent = torch.full((n,), -1, dtype=torch.long, device=device)
+        self.anchor_depth = torch.zeros((n,), dtype=torch.int32, device=device)
+        self.anchor_children_count = torch.zeros((n,), dtype=torch.int32, device=device)
+
+    def _ensure_anchor_tree(self):
+        n = self.get_anchor.shape[0]
+        device = self.get_anchor.device if self.get_anchor.numel() > 0 else torch.device("cuda")
+        if self.anchor_parent.numel() != n or self.anchor_depth.numel() != n or self.anchor_children_count.numel() != n:
+            self._init_anchor_tree()
+            return
+        self.anchor_parent = self.anchor_parent.to(device=device, dtype=torch.long)
+        self.anchor_depth = self.anchor_depth.to(device=device, dtype=torch.int32)
+        self.anchor_children_count = self.anchor_children_count.to(device=device, dtype=torch.int32)
+
+    def _compute_subtree_stats(self):
+        self._ensure_anchor_tree()
+        n = self.get_anchor.shape[0]
+        device = self.get_anchor.device
+        if n == 0:
+            empty = torch.empty(0, device=device)
+            return {
+                "subtree_error_mean": empty,
+                "subtree_error_count": empty,
+                "subtree_grad_mean": empty,
+                "subtree_grad_count": empty,
+                "subtree_opacity_mean": empty,
+                "subtree_visit_count": empty,
+                "subtree_size": empty,
+            }
+
+        if self.anchor_error_accum.numel() == n and self.anchor_error_denom.numel() == n:
+            anchor_error_count = self.anchor_error_denom.view(-1).float()
+            anchor_error_mean = (self.anchor_error_accum.view(-1) / anchor_error_count.clamp_min(1.0)).float()
+        else:
+            anchor_error_count = torch.zeros(n, device=device)
+            anchor_error_mean = torch.zeros(n, device=device)
+
+        offset_total = n * self.n_offsets
+        if self.offset_gradient_accum.numel() >= offset_total and self.offset_denom.numel() >= offset_total:
+            offset_grad_accum = self.offset_gradient_accum[:offset_total].view(n, self.n_offsets).float()
+            offset_grad_denom = self.offset_denom[:offset_total].view(n, self.n_offsets).float()
+            offset_grad_mean = offset_grad_accum / offset_grad_denom.clamp_min(1.0)
+            anchor_grad_count = offset_grad_denom.sum(dim=1)
+            anchor_grad_mean = offset_grad_mean.mean(dim=1)
+        else:
+            anchor_grad_count = torch.zeros(n, device=device)
+            anchor_grad_mean = torch.zeros(n, device=device)
+
+        if self.opacity_accum.numel() == n and self.anchor_demon.numel() == n:
+            anchor_visit_count = self.anchor_demon.view(-1).float()
+            anchor_opacity_mean = (self.opacity_accum.view(-1) / anchor_visit_count.clamp_min(1.0)).float()
+        else:
+            anchor_visit_count = torch.zeros(n, device=device)
+            anchor_opacity_mean = torch.zeros(n, device=device)
+
+        subtree_error_sum = anchor_error_mean * anchor_error_count
+        subtree_error_count = anchor_error_count.clone()
+        subtree_grad_sum = anchor_grad_mean * anchor_grad_count
+        subtree_grad_count = anchor_grad_count.clone()
+        subtree_opacity_sum = anchor_opacity_mean * anchor_visit_count
+        subtree_visit_count = anchor_visit_count.clone()
+        subtree_size = torch.ones(n, dtype=torch.float32, device=device)
+
+        max_depth = int(self.anchor_depth.max().item()) if self.anchor_depth.numel() > 0 else 0
+        for depth in range(max_depth, 0, -1):
+            child_ids = torch.nonzero(self.anchor_depth == depth, as_tuple=False).squeeze(1)
+            if child_ids.numel() == 0:
+                continue
+            parent_ids = self.anchor_parent[child_ids]
+            valid = parent_ids >= 0
+            if valid.sum() == 0:
+                continue
+            child_ids = child_ids[valid]
+            parent_ids = parent_ids[valid]
+            subtree_error_sum.scatter_add_(0, parent_ids, subtree_error_sum[child_ids])
+            subtree_error_count.scatter_add_(0, parent_ids, subtree_error_count[child_ids])
+            subtree_grad_sum.scatter_add_(0, parent_ids, subtree_grad_sum[child_ids])
+            subtree_grad_count.scatter_add_(0, parent_ids, subtree_grad_count[child_ids])
+            subtree_opacity_sum.scatter_add_(0, parent_ids, subtree_opacity_sum[child_ids])
+            subtree_visit_count.scatter_add_(0, parent_ids, subtree_visit_count[child_ids])
+            subtree_size.scatter_add_(0, parent_ids, subtree_size[child_ids])
+
+        return {
+            "subtree_error_mean": subtree_error_sum / subtree_error_count.clamp_min(1.0),
+            "subtree_error_count": subtree_error_count,
+            "subtree_grad_mean": subtree_grad_sum / subtree_grad_count.clamp_min(1.0),
+            "subtree_grad_count": subtree_grad_count,
+            "subtree_opacity_mean": subtree_opacity_sum / subtree_visit_count.clamp_min(1.0),
+            "subtree_visit_count": subtree_visit_count,
+            "subtree_size": subtree_size,
+        }
+
+    def _remap_anchor_tree_after_prune(self, prune_mask):
+        self._ensure_anchor_tree()
+        valid_points_mask = ~prune_mask
+        old_to_new = torch.full((prune_mask.shape[0],), -1, dtype=torch.long, device=prune_mask.device)
+        old_to_new[valid_points_mask] = torch.arange(valid_points_mask.sum(), device=prune_mask.device)
+
+        new_parent = self.anchor_parent[valid_points_mask].clone()
+        parent_valid = new_parent >= 0
+        if parent_valid.sum() > 0:
+            new_parent[parent_valid] = old_to_new[new_parent[parent_valid]]
+            orphan = parent_valid & (new_parent < 0)
+            new_parent[orphan] = -1
+
+        self.anchor_parent = new_parent.long()
+        self.anchor_depth = self.anchor_depth[valid_points_mask].clone().int()
+        self.anchor_depth[self.anchor_parent < 0] = 0
+        self.anchor_children_count = torch.zeros_like(self.anchor_depth, dtype=torch.int32)
+        valid_child = self.anchor_parent >= 0
+        if valid_child.sum() > 0:
+            self.anchor_children_count.scatter_add_(
+                0,
+                self.anchor_parent[valid_child],
+                torch.ones(valid_child.sum(), dtype=torch.int32, device=prune_mask.device),
+            )
+
+    def _save_tree_stats(self, path):
+        if self.anchor_parent.numel() != self.get_anchor.shape[0]:
+            self._init_anchor_tree()
+        stats_path = os.path.splitext(path)[0] + "_tree_stats.json"
+        if self.anchor_parent.numel() == 0:
+            payload = {"anchor_count": 0}
+        else:
+            children = self.anchor_children_count.detach().float()
+            depth = self.anchor_depth.detach()
+            payload = {
+                "anchor_count": int(self.get_anchor.shape[0]),
+                "max_tree_depth": int(depth.max().item()),
+                "mean_children_count": float(children.mean().item()),
+                "max_children_count": int(self.anchor_children_count.max().item()),
+                "leaf_anchor_count": int((self.anchor_children_count == 0).sum().item()),
+                "root_anchor_count": int((self.anchor_parent < 0).sum().item()),
+            }
+        with open(stats_path, "w") as fp:
+            json.dump(payload, fp, indent=2)
 
 
     def training_setup(self, training_args):
@@ -286,6 +474,15 @@ class GaussianModel:
         self.error_grow_weight = getattr(training_args, "error_grow_weight", 0.5)
         self.error_norm_clip = getattr(training_args, "error_norm_clip", 3.0)
         self.error_prune_keep_ratio = getattr(training_args, "error_prune_keep_ratio", 1.0)
+        self.use_tree_anchor_refinement = getattr(training_args, "use_tree_anchor_refinement", False)
+        self.tree_max_depth = getattr(training_args, "tree_max_depth", 6)
+        self.tree_grow_weight = getattr(training_args, "tree_grow_weight", 0.5)
+        self.tree_error_norm_clip = getattr(training_args, "tree_error_norm_clip", 3.0)
+        self.tree_error_keep_ratio = getattr(training_args, "tree_error_keep_ratio", 1.0)
+        self.tree_child_base_cap = getattr(training_args, "tree_child_base_cap", 4)
+        self.tree_child_high_cap = getattr(training_args, "tree_child_high_cap", 12)
+        self.tree_nonleaf_prune = getattr(training_args, "tree_nonleaf_prune", False)
+        self._ensure_anchor_tree()
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
@@ -434,6 +631,7 @@ class GaussianModel:
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
+        self._save_tree_stats(path)
 
     def load_ply_sparse_gaussian(self, path):
         plydata = PlyData.read(path)
@@ -476,6 +674,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._init_anchor_tree()
 
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -608,8 +807,9 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
     
-    def anchor_growing(self, grads, threshold, offset_mask):
+    def anchor_growing(self, grads, threshold, offset_mask, source_scores=None, tree_stats=None):
         ## 
+        self._ensure_anchor_tree()
         init_length = self.get_anchor.shape[0]*self.n_offsets
         for i in range(self.update_depth):
             # update threshold
@@ -629,6 +829,8 @@ class GaussianModel:
                     continue
             else:
                 candidate_mask = torch.cat([candidate_mask, torch.zeros(length_inc, dtype=torch.bool, device='cuda')], dim=0)
+            if candidate_mask.sum() == 0:
+                continue
 
             all_xyz = self.get_anchor.unsqueeze(dim=1) + self._offset * self.get_scaling[:,:3].unsqueeze(dim=1)
             
@@ -643,6 +845,18 @@ class GaussianModel:
             selected_grid_coords = torch.round(selected_xyz / cur_size).int()
 
             selected_grid_coords_unique, inverse_indices = torch.unique(selected_grid_coords, return_inverse=True, dim=0)
+            selected_offset_ids = torch.nonzero(candidate_mask, as_tuple=False).squeeze(1)
+            selected_parent_ids = torch.div(selected_offset_ids, self.n_offsets, rounding_mode="floor").long()
+            score_source = grads if source_scores is None else source_scores
+            if score_source.shape[0] < candidate_mask.shape[0]:
+                score_source = torch.cat([
+                    score_source,
+                    torch.full((candidate_mask.shape[0] - score_source.shape[0],), -1e9, dtype=score_source.dtype, device=score_source.device),
+                ], dim=0)
+            selected_scores = score_source[:candidate_mask.shape[0]][candidate_mask].float()
+            _, best_local = scatter_max(selected_scores, inverse_indices, dim=0)
+            best_parent = selected_parent_ids[best_local]
+            best_scores = selected_scores[best_local]
 
 
             ## split data for reducing peak memory calling
@@ -651,8 +865,8 @@ class GaussianModel:
                 chunk_size = 4096
                 max_iters = grid_coords.shape[0] // chunk_size + (1 if grid_coords.shape[0] % chunk_size != 0 else 0)
                 remove_duplicates_list = []
-                for i in range(max_iters):
-                    cur_remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords[i*chunk_size:(i+1)*chunk_size, :]).all(-1).any(-1).view(-1)
+                for chunk_idx in range(max_iters):
+                    cur_remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords[chunk_idx*chunk_size:(chunk_idx+1)*chunk_size, :]).all(-1).any(-1).view(-1)
                     remove_duplicates_list.append(cur_remove_duplicates)
                 
                 remove_duplicates = reduce(torch.logical_or, remove_duplicates_list)
@@ -661,6 +875,46 @@ class GaussianModel:
 
             remove_duplicates = ~remove_duplicates
             candidate_anchor = selected_grid_coords_unique[remove_duplicates]*cur_size
+            new_parent = best_parent[remove_duplicates]
+            candidate_scores = best_scores[remove_duplicates]
+
+            if self.use_tree_anchor_refinement and candidate_anchor.shape[0] > 0:
+                parent_depth = self.anchor_depth[new_parent].long()
+                depth_ok = parent_depth + 1 <= int(self.tree_max_depth)
+                if tree_stats is not None and tree_stats["subtree_error_mean"].numel() == self.anchor_parent.numel():
+                    subtree_error = tree_stats["subtree_error_mean"]
+                    subtree_visit = tree_stats["subtree_visit_count"]
+                    observed = subtree_visit > 0
+                    if observed.sum() > 0:
+                        global_error = subtree_error[observed].mean().clamp_min(1e-6)
+                        parent_high_error = subtree_error[new_parent] > global_error
+                    else:
+                        parent_high_error = torch.zeros_like(depth_ok)
+                else:
+                    parent_high_error = torch.zeros_like(depth_ok)
+                child_cap = torch.where(
+                    parent_high_error,
+                    torch.full_like(new_parent, int(self.tree_child_high_cap), dtype=torch.int32),
+                    torch.full_like(new_parent, int(self.tree_child_base_cap), dtype=torch.int32),
+                )
+                budget_ok = self.anchor_children_count[new_parent] < child_cap
+                keep = torch.logical_and(depth_ok, budget_ok)
+                if keep.sum() > 0:
+                    final_keep = torch.zeros_like(keep)
+                    for parent in torch.unique(new_parent[keep]):
+                        ids = torch.nonzero(torch.logical_and(keep, new_parent == parent), as_tuple=False).squeeze(1)
+                        cap = int(child_cap[ids[0]].item())
+                        current = int(self.anchor_children_count[parent].item())
+                        remaining = cap - current
+                        if remaining <= 0:
+                            continue
+                        if ids.numel() > remaining:
+                            top_ids = torch.topk(candidate_scores[ids], remaining).indices
+                            ids = ids[top_ids]
+                        final_keep[ids] = True
+                    keep = final_keep
+                candidate_anchor = candidate_anchor[keep]
+                new_parent = new_parent[keep]
 
             
             if candidate_anchor.shape[0] > 0:
@@ -671,9 +925,11 @@ class GaussianModel:
 
                 new_opacities = inverse_sigmoid(0.1 * torch.ones((candidate_anchor.shape[0], 1), dtype=torch.float, device="cuda"))
 
-                new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
-
-                new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
+                if self.use_tree_anchor_refinement:
+                    new_feat = self._anchor_feat[new_parent]
+                else:
+                    new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
+                    new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
 
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
 
@@ -694,6 +950,20 @@ class GaussianModel:
                 temp_opacity_accum = torch.cat([self.opacity_accum, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
                 del self.opacity_accum
                 self.opacity_accum = temp_opacity_accum
+
+                if self.use_tree_anchor_refinement:
+                    new_depth = (self.anchor_depth[new_parent].long() + 1).int()
+                    self.anchor_parent = torch.cat([self.anchor_parent, new_parent.long()], dim=0)
+                    self.anchor_depth = torch.cat([self.anchor_depth, new_depth], dim=0)
+                    self.anchor_children_count = torch.cat([
+                        self.anchor_children_count,
+                        torch.zeros(candidate_anchor.shape[0], dtype=torch.int32, device="cuda"),
+                    ], dim=0)
+                    self.anchor_children_count.scatter_add_(
+                        0,
+                        new_parent.long(),
+                        torch.ones(candidate_anchor.shape[0], dtype=torch.int32, device="cuda"),
+                    )
 
                 torch.cuda.empty_cache()
                 
@@ -722,8 +992,26 @@ class GaussianModel:
                 mean_error = offset_error_mean[observed_error].mean().clamp_min(1e-6)
                 error_norm = (offset_error_mean.squeeze(dim=1) / mean_error).clamp(max=self.error_norm_clip)
                 grow_scores = grads_norm * (1.0 + self.error_grow_weight * error_norm)
+
+        tree_stats = None
+        if self.use_tree_anchor_refinement:
+            tree_stats = self._compute_subtree_stats()
+            subtree_error = tree_stats["subtree_error_mean"]
+            subtree_visit = tree_stats["subtree_visit_count"]
+            observed = subtree_visit > 0
+            if observed.sum() > 0:
+                global_error = subtree_error[observed].mean().clamp_min(1e-6)
+                subtree_error_norm = (subtree_error / global_error).clamp(max=self.tree_error_norm_clip)
+                anchor_factor = 1.0 + self.tree_grow_weight * subtree_error_norm
+            else:
+                anchor_factor = torch.ones_like(subtree_error)
+            max_depth = max(int(self.tree_max_depth), 1)
+            depth_factor = 1.0 - self.anchor_depth.float().clamp(max=max_depth) / max_depth
+            anchor_factor = anchor_factor * depth_factor.clamp_min(0.1)
+            offset_anchor_ids = torch.arange(self.get_anchor.shape[0], device="cuda").repeat_interleave(self.n_offsets)
+            grow_scores = grow_scores * anchor_factor[offset_anchor_ids]
         
-        self.anchor_growing(grow_scores, grad_threshold, offset_mask)
+        self.anchor_growing(grow_scores, grad_threshold, offset_mask, source_scores=grow_scores, tree_stats=tree_stats)
 
         if self.use_error_aware_refinement:
             self.offset_error_accum[offset_mask] = 0
@@ -770,6 +1058,29 @@ class GaussianModel:
                 mean_anchor_error = anchor_error_mean[observed_anchor_error].mean().clamp_min(1e-6)
                 high_error_anchor = anchor_error_mean.squeeze(dim=1) > mean_anchor_error * self.error_prune_keep_ratio
                 prune_mask = torch.logical_and(prune_mask, ~high_error_anchor)
+
+        if self.use_tree_anchor_refinement:
+            tree_stats = self._compute_subtree_stats()
+            subtree_error = tree_stats["subtree_error_mean"]
+            subtree_grad = tree_stats["subtree_grad_mean"]
+            subtree_visit = tree_stats["subtree_visit_count"]
+            error_observed = tree_stats["subtree_error_count"] > 0
+            grad_observed = tree_stats["subtree_grad_count"] > 0
+            if error_observed.sum() > 0:
+                global_error = subtree_error[error_observed].mean().clamp_min(1e-6)
+                high_subtree_error = error_observed & (subtree_error > global_error * self.tree_error_keep_ratio)
+            else:
+                high_subtree_error = torch.zeros_like(prune_mask)
+            if grad_observed.sum() > 0:
+                global_grad = subtree_grad[grad_observed].mean().clamp_min(1e-12)
+                active_subtree_grad = grad_observed & (subtree_grad > global_grad)
+            else:
+                active_subtree_grad = torch.zeros_like(prune_mask)
+            mature_subtree = subtree_visit > check_interval * success_threshold
+            protect_by_tree = mature_subtree & (high_subtree_error | active_subtree_grad)
+            prune_mask = torch.logical_and(prune_mask, ~protect_by_tree)
+            if not self.tree_nonleaf_prune:
+                prune_mask = torch.logical_and(prune_mask, self.anchor_children_count == 0)
         
         # update offset_denom
         offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
@@ -815,6 +1126,9 @@ class GaussianModel:
             del self.anchor_error_denom
             self.anchor_error_accum = temp_anchor_error_accum
             self.anchor_error_denom = temp_anchor_error_denom
+
+        if self.use_tree_anchor_refinement and prune_mask.shape[0] > 0:
+            self._remap_anchor_tree_after_prune(prune_mask)
 
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)
