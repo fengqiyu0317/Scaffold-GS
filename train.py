@@ -157,6 +157,16 @@ def sobel_luma_edges(luma):
     return F.conv2d(luma_4d, sobel_x, padding=1).squeeze(0), F.conv2d(luma_4d, sobel_y, padding=1).squeeze(0)
 
 
+def sobel_edge_loss(image, gt_image):
+    pred_luma = compute_luma(image.clamp(0.0, 1.0))
+    gt_luma = compute_luma(gt_image.clamp(0.0, 1.0))
+    pred_grad_x, pred_grad_y = sobel_luma_edges(pred_luma)
+    gt_grad_x, gt_grad_y = sobel_luma_edges(gt_luma)
+    pred_edge = torch.sqrt(pred_grad_x.pow(2) + pred_grad_y.pow(2) + 1e-12)
+    gt_edge = torch.sqrt(gt_grad_x.pow(2) + gt_grad_y.pow(2) + 1e-12)
+    return torch.abs(pred_edge - gt_edge).mean()
+
+
 def build_component_refinement_maps(image, gt_image, opt):
     image_detached = image.detach().clamp(0.0, 1.0)
     gt_detached = gt_image.detach().clamp(0.0, 1.0)
@@ -575,7 +585,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg + component_loss
+        edge_loss = image.new_tensor(0.0)
+        if getattr(opt, "use_edge_loss", False) and getattr(opt, "edge_loss_weight", 0.0) > 0.0:
+            edge_loss = sobel_edge_loss(image, gt_image)
+        loss = ((1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss +
+                0.01*scaling_reg + component_loss + opt.edge_loss_weight * edge_loss)
 
         loss.backward()
         
