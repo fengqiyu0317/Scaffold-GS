@@ -170,6 +170,15 @@ class OptimizationParams(ParamGroup):
         self.tree_child_high_cap = 12
         self.tree_nonleaf_prune = False
 
+        # Optional V1.2 highlight-aware tree growing. This only affects
+        # refinement attribution and tree growing; pruning stays V1.1-style.
+        self.use_highlight_aware_refinement = False
+        self.highlight_grow_weight = 0.5
+        self.highlight_error_norm_clip = 3.0
+        self.highlight_tree_weight = 0.5
+        self.highlight_luma_threshold = 0.65
+        self.highlight_local_contrast = 0.08
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

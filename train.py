@@ -113,6 +113,23 @@ def sample_neural_gaussian_errors(viewpoint_camera, neural_xyz, visibility_filte
     return errors, valid_mask
 
 
+def build_highlight_refinement_error(gt_image, error_map, opt):
+    gt_luma = 0.299 * gt_image[0] + 0.587 * gt_image[1] + 0.114 * gt_image[2]
+    local_mean = torch.nn.functional.avg_pool2d(
+        gt_luma.unsqueeze(0).unsqueeze(0), kernel_size=9, stride=1, padding=4
+    ).squeeze(0).squeeze(0)
+    highlight_mask = (gt_luma > opt.highlight_luma_threshold) & (
+        (gt_luma - local_mean) > opt.highlight_local_contrast
+    )
+
+    highlight_error = error_map * highlight_mask.float()
+    if highlight_mask.any():
+        max_error = error_map.mean().clamp_min(1e-6) * opt.highlight_error_norm_clip
+        highlight_error = highlight_error.clamp(max=max_error)
+        highlight_error = highlight_error * (1.0 + opt.highlight_grow_weight)
+    return highlight_error
+
+
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -174,11 +191,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gt_image = viewpoint_cam.original_image.cuda()
         neural_errors = None
         neural_error_filter = None
+        neural_highlight_errors = None
+        neural_highlight_error_filter = None
         if opt.use_error_aware_refinement and iteration < opt.update_until and iteration > opt.start_stat:
             error_map = torch.abs(image.detach() - gt_image.detach()).mean(dim=0)
             neural_errors, neural_error_filter = sample_neural_gaussian_errors(
                 viewpoint_cam, render_pkg["neural_xyz"], visibility_filter, error_map
             )
+            if opt.use_highlight_aware_refinement:
+                highlight_error_map = build_highlight_refinement_error(gt_image.detach(), error_map, opt)
+                neural_highlight_errors, neural_highlight_error_filter = sample_neural_gaussian_errors(
+                    viewpoint_cam, render_pkg["neural_xyz"], visibility_filter, highlight_error_map
+                )
         Ll1 = l1_loss(image, gt_image)
 
         ssim_loss = (1.0 - ssim(image, gt_image))
@@ -214,6 +238,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     neural_error_filter=neural_error_filter,
                     neural_offset_indices=render_pkg.get("neural_offset_indices", None),
                     neural_anchor_indices=render_pkg.get("neural_anchor_indices", None),
+                    neural_highlight_errors=neural_highlight_errors,
+                    neural_highlight_error_filter=neural_highlight_error_filter,
                 )
                 
                 # densification
@@ -228,6 +254,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     del gaussians.offset_error_denom
                     del gaussians.anchor_error_accum
                     del gaussians.anchor_error_denom
+                if getattr(gaussians, "use_highlight_aware_refinement", False):
+                    del gaussians.offset_highlight_error_accum
+                    del gaussians.offset_highlight_error_denom
+                    del gaussians.anchor_highlight_error_accum
+                    del gaussians.anchor_highlight_error_denom
                 torch.cuda.empty_cache()
                     
             # Optimizer step

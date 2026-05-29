@@ -84,10 +84,18 @@ class GaussianModel:
         self.offset_error_denom = torch.empty(0)
         self.anchor_error_accum = torch.empty(0)
         self.anchor_error_denom = torch.empty(0)
+        self.offset_highlight_error_accum = torch.empty(0)
+        self.offset_highlight_error_denom = torch.empty(0)
+        self.anchor_highlight_error_accum = torch.empty(0)
+        self.anchor_highlight_error_denom = torch.empty(0)
         self.use_error_aware_refinement = False
         self.error_grow_weight = 0.5
         self.error_norm_clip = 3.0
         self.error_prune_keep_ratio = 1.0
+        self.use_highlight_aware_refinement = False
+        self.highlight_grow_weight = 0.5
+        self.highlight_error_norm_clip = 3.0
+        self.highlight_tree_weight = 0.5
 
         self.anchor_parent = torch.empty(0, dtype=torch.long)
         self.anchor_depth = torch.empty(0, dtype=torch.int32)
@@ -353,6 +361,8 @@ class GaussianModel:
             return {
                 "subtree_error_mean": empty,
                 "subtree_error_count": empty,
+                "subtree_highlight_error_mean": empty,
+                "subtree_highlight_error_count": empty,
                 "subtree_grad_mean": empty,
                 "subtree_grad_count": empty,
                 "subtree_opacity_mean": empty,
@@ -366,6 +376,15 @@ class GaussianModel:
         else:
             anchor_error_count = torch.zeros(n, device=device)
             anchor_error_mean = torch.zeros(n, device=device)
+
+        if self.anchor_highlight_error_accum.numel() == n and self.anchor_highlight_error_denom.numel() == n:
+            anchor_highlight_error_count = self.anchor_highlight_error_denom.view(-1).float()
+            anchor_highlight_error_mean = (
+                self.anchor_highlight_error_accum.view(-1) / anchor_highlight_error_count.clamp_min(1.0)
+            ).float()
+        else:
+            anchor_highlight_error_count = torch.zeros(n, device=device)
+            anchor_highlight_error_mean = torch.zeros(n, device=device)
 
         offset_total = n * self.n_offsets
         if self.offset_gradient_accum.numel() >= offset_total and self.offset_denom.numel() >= offset_total:
@@ -387,6 +406,8 @@ class GaussianModel:
 
         subtree_error_sum = anchor_error_mean * anchor_error_count
         subtree_error_count = anchor_error_count.clone()
+        subtree_highlight_error_sum = anchor_highlight_error_mean * anchor_highlight_error_count
+        subtree_highlight_error_count = anchor_highlight_error_count.clone()
         subtree_grad_sum = anchor_grad_mean * anchor_grad_count
         subtree_grad_count = anchor_grad_count.clone()
         subtree_opacity_sum = anchor_opacity_mean * anchor_visit_count
@@ -406,6 +427,8 @@ class GaussianModel:
             parent_ids = parent_ids[valid]
             subtree_error_sum.scatter_add_(0, parent_ids, subtree_error_sum[child_ids])
             subtree_error_count.scatter_add_(0, parent_ids, subtree_error_count[child_ids])
+            subtree_highlight_error_sum.scatter_add_(0, parent_ids, subtree_highlight_error_sum[child_ids])
+            subtree_highlight_error_count.scatter_add_(0, parent_ids, subtree_highlight_error_count[child_ids])
             subtree_grad_sum.scatter_add_(0, parent_ids, subtree_grad_sum[child_ids])
             subtree_grad_count.scatter_add_(0, parent_ids, subtree_grad_count[child_ids])
             subtree_opacity_sum.scatter_add_(0, parent_ids, subtree_opacity_sum[child_ids])
@@ -415,6 +438,8 @@ class GaussianModel:
         return {
             "subtree_error_mean": subtree_error_sum / subtree_error_count.clamp_min(1.0),
             "subtree_error_count": subtree_error_count,
+            "subtree_highlight_error_mean": subtree_highlight_error_sum / subtree_highlight_error_count.clamp_min(1.0),
+            "subtree_highlight_error_count": subtree_highlight_error_count,
             "subtree_grad_mean": subtree_grad_sum / subtree_grad_count.clamp_min(1.0),
             "subtree_grad_count": subtree_grad_count,
             "subtree_opacity_mean": subtree_opacity_sum / subtree_visit_count.clamp_min(1.0),
@@ -482,6 +507,10 @@ class GaussianModel:
         self.tree_child_base_cap = getattr(training_args, "tree_child_base_cap", 4)
         self.tree_child_high_cap = getattr(training_args, "tree_child_high_cap", 12)
         self.tree_nonleaf_prune = getattr(training_args, "tree_nonleaf_prune", False)
+        self.use_highlight_aware_refinement = getattr(training_args, "use_highlight_aware_refinement", False)
+        self.highlight_grow_weight = getattr(training_args, "highlight_grow_weight", 0.5)
+        self.highlight_error_norm_clip = getattr(training_args, "highlight_error_norm_clip", 3.0)
+        self.highlight_tree_weight = getattr(training_args, "highlight_tree_weight", 0.5)
         self._ensure_anchor_tree()
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
@@ -493,6 +522,10 @@ class GaussianModel:
         self.offset_error_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_error_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
         self.anchor_error_denom = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.offset_highlight_error_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
+        self.offset_highlight_error_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
+        self.anchor_highlight_error_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.anchor_highlight_error_denom = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
         
         
@@ -722,7 +755,8 @@ class GaussianModel:
 
     # statis grad information to guide liftting. 
     def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask,
-                        neural_errors=None, neural_error_filter=None, neural_offset_indices=None, neural_anchor_indices=None):
+                        neural_errors=None, neural_error_filter=None, neural_offset_indices=None, neural_anchor_indices=None,
+                        neural_highlight_errors=None, neural_highlight_error_filter=None):
         # update opacity stats
         temp_opacity = opacity.clone().view(-1).detach()
         temp_opacity[temp_opacity<0] = 0
@@ -755,6 +789,19 @@ class GaussianModel:
                 self.offset_error_denom.scatter_add_(0, offset_indices, ones)
                 self.anchor_error_accum.scatter_add_(0, anchor_indices, error_values)
                 self.anchor_error_denom.scatter_add_(0, anchor_indices, ones)
+
+        if self.use_highlight_aware_refinement and neural_highlight_errors is not None and neural_offset_indices is not None and neural_anchor_indices is not None:
+            highlight_filter = update_filter if neural_highlight_error_filter is None else torch.logical_and(update_filter, neural_highlight_error_filter)
+            highlight_filter = torch.logical_and(highlight_filter, neural_highlight_errors.detach().view(-1) > 0)
+            if highlight_filter.sum() > 0:
+                highlight_values = neural_highlight_errors[highlight_filter].detach().view(-1, 1)
+                offset_indices = neural_offset_indices[highlight_filter].detach().long().view(-1, 1)
+                anchor_indices = neural_anchor_indices[highlight_filter].detach().long().view(-1, 1)
+                ones = torch.ones_like(highlight_values)
+                self.offset_highlight_error_accum.scatter_add_(0, offset_indices, highlight_values)
+                self.offset_highlight_error_denom.scatter_add_(0, offset_indices, ones)
+                self.anchor_highlight_error_accum.scatter_add_(0, anchor_indices, highlight_values)
+                self.anchor_highlight_error_denom.scatter_add_(0, anchor_indices, ones)
 
         
 
@@ -997,6 +1044,8 @@ class GaussianModel:
         if self.use_tree_anchor_refinement:
             tree_stats = self._compute_subtree_stats()
             subtree_error = tree_stats["subtree_error_mean"]
+            if self.use_highlight_aware_refinement:
+                subtree_error = subtree_error + self.highlight_tree_weight * tree_stats["subtree_highlight_error_mean"]
             subtree_visit = tree_stats["subtree_visit_count"]
             observed = subtree_visit > 0
             if observed.sum() > 0:
@@ -1032,6 +1081,26 @@ class GaussianModel:
                                                      dtype=self.anchor_error_denom.dtype,
                                                      device=self.anchor_error_denom.device)
             self.anchor_error_denom = torch.cat([self.anchor_error_denom, padding_anchor_error_denom], dim=0)
+
+        if self.use_highlight_aware_refinement:
+            self.offset_highlight_error_accum[offset_mask] = 0
+            self.offset_highlight_error_denom[offset_mask] = 0
+            padding_offset_highlight_error = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_highlight_error_accum.shape[0], 1],
+                                                        dtype=self.offset_highlight_error_accum.dtype,
+                                                        device=self.offset_highlight_error_accum.device)
+            self.offset_highlight_error_accum = torch.cat([self.offset_highlight_error_accum, padding_offset_highlight_error], dim=0)
+            padding_offset_highlight_error_denom = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_highlight_error_denom.shape[0], 1],
+                                                              dtype=self.offset_highlight_error_denom.dtype,
+                                                              device=self.offset_highlight_error_denom.device)
+            self.offset_highlight_error_denom = torch.cat([self.offset_highlight_error_denom, padding_offset_highlight_error_denom], dim=0)
+            padding_anchor_highlight_error = torch.zeros([self.get_anchor.shape[0] - self.anchor_highlight_error_accum.shape[0], 1],
+                                                        dtype=self.anchor_highlight_error_accum.dtype,
+                                                        device=self.anchor_highlight_error_accum.device)
+            self.anchor_highlight_error_accum = torch.cat([self.anchor_highlight_error_accum, padding_anchor_highlight_error], dim=0)
+            padding_anchor_highlight_error_denom = torch.zeros([self.get_anchor.shape[0] - self.anchor_highlight_error_denom.shape[0], 1],
+                                                              dtype=self.anchor_highlight_error_denom.dtype,
+                                                              device=self.anchor_highlight_error_denom.device)
+            self.anchor_highlight_error_denom = torch.cat([self.anchor_highlight_error_denom, padding_anchor_highlight_error_denom], dim=0)
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0
@@ -1102,6 +1171,16 @@ class GaussianModel:
             del self.offset_error_denom
             self.offset_error_accum = offset_error_accum
             self.offset_error_denom = offset_error_denom
+
+        if self.use_highlight_aware_refinement:
+            offset_highlight_error_accum = self.offset_highlight_error_accum.view([-1, self.n_offsets])[~prune_mask]
+            offset_highlight_error_accum = offset_highlight_error_accum.view([-1, 1])
+            offset_highlight_error_denom = self.offset_highlight_error_denom.view([-1, self.n_offsets])[~prune_mask]
+            offset_highlight_error_denom = offset_highlight_error_denom.view([-1, 1])
+            del self.offset_highlight_error_accum
+            del self.offset_highlight_error_denom
+            self.offset_highlight_error_accum = offset_highlight_error_accum
+            self.offset_highlight_error_denom = offset_highlight_error_denom
         
         # update opacity accum 
         if anchors_mask.sum()>0:
@@ -1110,6 +1189,9 @@ class GaussianModel:
             if self.use_error_aware_refinement:
                 self.anchor_error_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
                 self.anchor_error_denom[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
+            if self.use_highlight_aware_refinement:
+                self.anchor_highlight_error_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
+                self.anchor_highlight_error_denom[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
         
         temp_opacity_accum = self.opacity_accum[~prune_mask]
         del self.opacity_accum
@@ -1126,6 +1208,14 @@ class GaussianModel:
             del self.anchor_error_denom
             self.anchor_error_accum = temp_anchor_error_accum
             self.anchor_error_denom = temp_anchor_error_denom
+
+        if self.use_highlight_aware_refinement:
+            temp_anchor_highlight_error_accum = self.anchor_highlight_error_accum[~prune_mask]
+            temp_anchor_highlight_error_denom = self.anchor_highlight_error_denom[~prune_mask]
+            del self.anchor_highlight_error_accum
+            del self.anchor_highlight_error_denom
+            self.anchor_highlight_error_accum = temp_anchor_highlight_error_accum
+            self.anchor_highlight_error_denom = temp_anchor_highlight_error_denom
 
         if self.use_tree_anchor_refinement and prune_mask.shape[0] > 0:
             self._remap_anchor_tree_after_prune(prune_mask)
