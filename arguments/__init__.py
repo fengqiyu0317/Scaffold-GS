@@ -216,6 +216,15 @@ class OptimizationParams(ParamGroup):
         self.component_ray_depth_samples = 3
         self.component_candidate_max_per_interval = 512
 
+        # Optional dynamic error-weighted photometric loss.
+        self.use_dynamic_error_weighted_loss = False
+        self.error_loss_weight = 0.5
+        self.error_weight_clip = 3.0
+        # Legacy aliases retained for old experiment commands.
+        self.use_error_weighted_loss = False
+        self.lambda_error_loss = 0.25
+        self.error_loss_clip = 3.0
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

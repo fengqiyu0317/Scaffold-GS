@@ -562,6 +562,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         component_active = (getattr(opt, "use_component_refinement", False)
                             and iteration >= getattr(opt, "component_refine_start", opt.update_from)
                             and iteration < getattr(opt, "component_refine_until", opt.update_until))
+        use_dynamic_error_weighted_loss = (
+            getattr(opt, "use_dynamic_error_weighted_loss", False)
+            or getattr(opt, "use_error_weighted_loss", False)
+        )
+        error_map = None
+        if use_dynamic_error_weighted_loss:
+            error_map = torch.abs(image.detach() - gt_image.detach()).mean(dim=0)
         if opt.use_error_aware_refinement and iteration < opt.update_until and iteration > opt.start_stat:
             error_map = build_refinement_error_map(image, gt_image, opt)
             neural_errors, neural_error_filter = sample_neural_gaussian_errors(
@@ -582,13 +589,24 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 opt,
             )
         Ll1 = l1_loss(image, gt_image)
+        Ll1_for_loss = Ll1
+        if use_dynamic_error_weighted_loss:
+            error_norm = error_map / error_map.mean().clamp_min(1e-6)
+            if getattr(opt, "use_dynamic_error_weighted_loss", False):
+                error_loss_weight = getattr(opt, "error_loss_weight", 0.5)
+                error_weight_clip = getattr(opt, "error_weight_clip", 3.0)
+            else:
+                error_loss_weight = getattr(opt, "lambda_error_loss", 0.25)
+                error_weight_clip = getattr(opt, "error_loss_clip", 3.0)
+            error_weight = 1.0 + error_loss_weight * error_norm.clamp(max=error_weight_clip)
+            Ll1_for_loss = (error_weight * torch.abs(image - gt_image).mean(dim=0)).mean()
 
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
         edge_loss = image.new_tensor(0.0)
         if getattr(opt, "use_edge_loss", False) and getattr(opt, "edge_loss_weight", 0.0) > 0.0:
             edge_loss = sobel_edge_loss(image, gt_image)
-        loss = ((1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss +
+        loss = ((1.0 - opt.lambda_dssim) * Ll1_for_loss + opt.lambda_dssim * ssim_loss +
                 0.01*scaling_reg + component_loss + opt.edge_loss_weight * edge_loss)
 
         loss.backward()
