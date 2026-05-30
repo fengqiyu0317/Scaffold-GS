@@ -169,6 +169,15 @@ class GaussianModel:
         self.anchor_component_denom = torch.empty(0)
         self.anchor_component_views = torch.empty(0)
         self.component_candidate_xyz = torch.empty(0)
+        self.use_add_gaussian = False
+        self.add_gaussian_budget_per_interval = 256
+        self.add_gaussian_max_anchor_ratio = 1.10
+        self.add_gaussian_jitter_voxels = 1.0
+        self.add_gaussian_min_votes = 2
+        self.add_gaussian_pending_limit = 4096
+        self.add_gaussian_pending_grid = torch.empty(0)
+        self.add_gaussian_pending_votes = torch.empty(0)
+        self.add_gaussian_pending_last_uid = torch.empty(0)
 
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
@@ -379,6 +388,12 @@ class GaussianModel:
         self.component_visit_threshold_scale = getattr(training_args, "component_visit_threshold_scale", 0.25)
         self.component_proposal_level = getattr(training_args, "component_proposal_level", 0)
         self.component_candidate_max_per_interval = getattr(training_args, "component_candidate_max_per_interval", 512)
+        self.use_add_gaussian = getattr(training_args, "use_add_gaussian", False)
+        self.add_gaussian_budget_per_interval = getattr(training_args, "add_gaussian_budget_per_interval", 256)
+        self.add_gaussian_max_anchor_ratio = getattr(training_args, "add_gaussian_max_anchor_ratio", 1.10)
+        self.add_gaussian_jitter_voxels = getattr(training_args, "add_gaussian_jitter_voxels", 1.0)
+        self.add_gaussian_min_votes = getattr(training_args, "add_gaussian_min_votes", 2)
+        self.add_gaussian_pending_limit = getattr(training_args, "add_gaussian_pending_limit", 4096)
         self.initial_anchor_count = self.get_anchor.shape[0]
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
@@ -398,6 +413,9 @@ class GaussianModel:
         self.anchor_component_denom = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
         self.anchor_component_views = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
         self.component_candidate_xyz = torch.empty((0, 3), device="cuda")
+        self.add_gaussian_pending_grid = torch.empty((0, 3), dtype=torch.int32, device="cuda")
+        self.add_gaussian_pending_votes = torch.empty((0, 1), dtype=torch.int32, device="cuda")
+        self.add_gaussian_pending_last_uid = torch.empty((0, 1), dtype=torch.long, device="cuda")
 
         
         
@@ -628,7 +646,8 @@ class GaussianModel:
                         neural_errors=None, neural_error_filter=None, neural_offset_indices=None, neural_anchor_indices=None,
                         component_scores=None, component_score_filter=None,
                         component_proposal_scores=None, component_proposal_filter=None,
-                        component_candidate_xyz=None):
+                        component_candidate_xyz=None,
+                        add_gaussian_candidate_xyz=None, add_gaussian_view_uid=None):
         # update opacity stats
         temp_opacity = opacity.clone().view(-1).detach()
         temp_opacity[temp_opacity<0] = 0
@@ -702,6 +721,9 @@ class GaussianModel:
             if self.component_candidate_xyz.shape[0] > max_candidates:
                 keep = torch.randperm(self.component_candidate_xyz.shape[0], device=self.component_candidate_xyz.device)[:max_candidates]
                 self.component_candidate_xyz = self.component_candidate_xyz[keep]
+
+        if self.use_add_gaussian and add_gaussian_candidate_xyz is not None and add_gaussian_view_uid is not None:
+            self.accumulate_add_gaussian_candidates(add_gaussian_candidate_xyz, add_gaussian_view_uid)
 
         
 
@@ -939,6 +961,92 @@ class GaussianModel:
         self._opacity = optimizable_tensors['opacity']
         return candidate_anchor.shape[0]
 
+    def get_finest_voxel_size(self):
+        finest_factor = max(self.update_init_factor // (self.update_hierachy_factor ** max(self.update_depth - 1, 0)), 1)
+        return self.voxel_size * finest_factor
+
+    def accumulate_add_gaussian_candidates(self, candidate_xyz, view_uid):
+        if not self.use_add_gaussian or candidate_xyz is None or candidate_xyz.numel() == 0:
+            return
+
+        cur_size = self.get_finest_voxel_size()
+        candidate_grid = torch.round(candidate_xyz.detach() / cur_size).int()
+        candidate_grid = torch.unique(candidate_grid, dim=0)
+        if candidate_grid.shape[0] == 0:
+            return
+
+        existing_grid = torch.round(self.get_anchor.detach() / cur_size).int()
+        chunk_size = 4096
+        duplicate_list = []
+        for start in range(0, existing_grid.shape[0], chunk_size):
+            duplicate = (candidate_grid.unsqueeze(1) == existing_grid[start:start + chunk_size]).all(-1).any(-1)
+            duplicate_list.append(duplicate)
+        if duplicate_list:
+            duplicate_existing = reduce(torch.logical_or, duplicate_list)
+            candidate_grid = candidate_grid[~duplicate_existing]
+        if candidate_grid.shape[0] == 0:
+            return
+
+        view_uid_tensor = torch.full((candidate_grid.shape[0], 1), int(view_uid), dtype=torch.long, device=candidate_grid.device)
+        new_votes = torch.ones((candidate_grid.shape[0], 1), dtype=torch.int32, device=candidate_grid.device)
+
+        if self.add_gaussian_pending_grid.numel() == 0:
+            self.add_gaussian_pending_grid = candidate_grid
+            self.add_gaussian_pending_votes = new_votes
+            self.add_gaussian_pending_last_uid = view_uid_tensor
+        else:
+            pending = self.add_gaussian_pending_grid
+            matches = (candidate_grid.unsqueeze(1) == pending.unsqueeze(0)).all(-1)
+            has_match = matches.any(dim=1)
+            if has_match.any():
+                candidate_ids = torch.nonzero(has_match, as_tuple=False).view(-1)
+                pending_ids = matches[has_match].float().argmax(dim=1).long()
+                different_view = self.add_gaussian_pending_last_uid[pending_ids].view(-1) != int(view_uid)
+                if different_view.any():
+                    pending_ids = pending_ids[different_view]
+                    self.add_gaussian_pending_votes[pending_ids] += 1
+                    self.add_gaussian_pending_last_uid[pending_ids] = int(view_uid)
+
+            if (~has_match).any():
+                self.add_gaussian_pending_grid = torch.cat([self.add_gaussian_pending_grid, candidate_grid[~has_match]], dim=0)
+                self.add_gaussian_pending_votes = torch.cat([self.add_gaussian_pending_votes, new_votes[~has_match]], dim=0)
+                self.add_gaussian_pending_last_uid = torch.cat([self.add_gaussian_pending_last_uid, view_uid_tensor[~has_match]], dim=0)
+
+        max_pending = max(1, int(self.add_gaussian_pending_limit))
+        if self.add_gaussian_pending_grid.shape[0] > max_pending:
+            keep = torch.randperm(self.add_gaussian_pending_grid.shape[0], device=self.add_gaussian_pending_grid.device)[:max_pending]
+            self.add_gaussian_pending_grid = self.add_gaussian_pending_grid[keep]
+            self.add_gaussian_pending_votes = self.add_gaussian_pending_votes[keep]
+            self.add_gaussian_pending_last_uid = self.add_gaussian_pending_last_uid[keep]
+
+    def add_pending_add_gaussian_anchors(self, max_new_anchors=None):
+        if (not self.use_add_gaussian or self.add_gaussian_pending_grid.numel() == 0 or
+                max_new_anchors is not None and max_new_anchors <= 0):
+            return 0
+
+        ready = self.add_gaussian_pending_votes.view(-1) >= int(self.add_gaussian_min_votes)
+        if ready.sum() == 0:
+            return 0
+
+        ready_indices = torch.nonzero(ready, as_tuple=False).view(-1)
+        if max_new_anchors is not None and ready_indices.shape[0] > max_new_anchors:
+            keep = torch.randperm(ready_indices.shape[0], device=ready_indices.device)[:max_new_anchors]
+            ready_indices = ready_indices[keep]
+
+        cur_size = self.get_finest_voxel_size()
+        candidate_xyz = self.add_gaussian_pending_grid[ready_indices].float() * cur_size
+        jitter_scale = float(cur_size) * float(self.add_gaussian_jitter_voxels)
+        if jitter_scale > 0.0:
+            candidate_xyz = candidate_xyz + (torch.rand_like(candidate_xyz) * 2.0 - 1.0) * jitter_scale
+        added = self.add_component_candidate_anchors(candidate_xyz, max_new_anchors=max_new_anchors)
+
+        keep_pending = torch.ones((self.add_gaussian_pending_grid.shape[0],), dtype=torch.bool, device=self.add_gaussian_pending_grid.device)
+        keep_pending[ready_indices] = False
+        self.add_gaussian_pending_grid = self.add_gaussian_pending_grid[keep_pending]
+        self.add_gaussian_pending_votes = self.add_gaussian_pending_votes[keep_pending]
+        self.add_gaussian_pending_last_uid = self.add_gaussian_pending_last_uid[keep_pending]
+        return added
+
 
     def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
         # # adding anchors
@@ -1001,6 +1109,15 @@ class GaussianModel:
             if max_new_anchors is not None:
                 candidate_budget = min(candidate_budget, max(0, max_new_anchors - added_from_growth))
             added_from_candidates = self.add_component_candidate_anchors(self.component_candidate_xyz, max_new_anchors=candidate_budget)
+
+        added_from_add_gaussian = 0
+        if self.use_add_gaussian and self.add_gaussian_pending_grid.numel() > 0:
+            max_total_add_anchors = max(self.get_anchor.shape[0], int(self.initial_anchor_count * self.add_gaussian_max_anchor_ratio))
+            remaining_add_budget = max_total_add_anchors - self.get_anchor.shape[0]
+            interval_add_budget = min(int(self.add_gaussian_budget_per_interval), max(0, remaining_add_budget))
+            added_from_add_gaussian = self.add_pending_add_gaussian_anchors(max_new_anchors=interval_add_budget)
+            if added_from_add_gaussian > 0 or self.add_gaussian_pending_grid.numel() > 0:
+                print(f"[add_gaussian] pending={self.add_gaussian_pending_grid.shape[0]} added={added_from_add_gaussian} anchors={self.get_anchor.shape[0]}")
 
         if self.use_error_aware_refinement:
             self.offset_error_accum[offset_mask] = 0

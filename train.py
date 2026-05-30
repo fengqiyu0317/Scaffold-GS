@@ -285,6 +285,47 @@ def sample_neural_gaussian_errors(viewpoint_camera, neural_xyz, visibility_filte
     return errors, valid_mask
 
 
+def build_add_gaussian_candidates(viewpoint_camera, neural_xyz, visibility_filter, error_map, opt, voxel_size):
+    if neural_xyz.numel() == 0:
+        return torch.zeros((0, 3), dtype=error_map.dtype, device=error_map.device)
+
+    errors, valid_filter = sample_neural_gaussian_errors(
+        viewpoint_camera, neural_xyz, visibility_filter, error_map, opt
+    )
+    errors = errors.detach().view(-1)
+    candidate_filter = valid_filter.detach() & visibility_filter.detach() & torch.isfinite(errors)
+    if candidate_filter.sum() == 0:
+        return torch.zeros((0, 3), dtype=error_map.dtype, device=error_map.device)
+
+    candidate_errors = errors[candidate_filter].clamp_min(0.0)
+    positive = candidate_errors > candidate_errors.mean().clamp_min(1e-8)
+    if positive.sum() == 0:
+        positive = candidate_errors > 0
+    if positive.sum() == 0:
+        return torch.zeros((0, 3), dtype=error_map.dtype, device=error_map.device)
+
+    candidate_indices = torch.nonzero(candidate_filter, as_tuple=False).view(-1)[positive]
+    weights = candidate_errors[positive].clamp_min(1e-8)
+    source_budget = max(1, int(getattr(opt, "add_gaussian_budget_per_interval", 256)))
+    if candidate_indices.shape[0] > source_budget:
+        sampled = torch.multinomial(weights, source_budget, replacement=False)
+        candidate_indices = candidate_indices[sampled]
+
+    source_grid = torch.round(neural_xyz.detach()[candidate_indices] / float(voxel_size)).int()
+    neighbor_offsets = source_grid.new_tensor([
+        [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1],
+        [1, 1, 0], [1, -1, 0], [-1, 1, 0], [-1, -1, 0],
+        [1, 0, 1], [1, 0, -1], [-1, 0, 1], [-1, 0, -1],
+        [0, 1, 1], [0, 1, -1], [0, -1, 1], [0, -1, -1],
+        [1, 1, 1], [1, 1, -1], [1, -1, 1], [1, -1, -1],
+        [-1, 1, 1], [-1, 1, -1], [-1, -1, 1], [-1, -1, -1],
+    ])
+    neighbor_count = min(neighbor_offsets.shape[0], max(1, int(getattr(opt, "add_gaussian_candidate_multiplier", 4))))
+    proposal_grid = source_grid[:, None, :] + neighbor_offsets[:neighbor_count][None, :, :]
+    proposal_grid = torch.unique(proposal_grid.reshape(-1, 3), dim=0)
+    return proposal_grid.float() * float(voxel_size)
+
+
 def project_points_to_image(viewpoint_camera, xyz):
     if xyz.numel() == 0:
         empty_grid = torch.zeros((0, 2), dtype=xyz.dtype, device=xyz.device)
@@ -549,13 +590,28 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         component_proposal_scores = None
         component_proposal_filter = None
         component_candidate_xyz = None
+        add_gaussian_candidate_xyz = None
         component_active = (getattr(opt, "use_component_refinement", False)
                             and iteration >= getattr(opt, "component_refine_start", opt.update_from)
                             and iteration < getattr(opt, "component_refine_until", opt.update_until))
-        if opt.use_error_aware_refinement and iteration < opt.update_until and iteration > opt.start_stat:
+        add_gaussian_active = (getattr(opt, "use_add_gaussian", False)
+                               and iteration >= getattr(opt, "add_gaussian_start", opt.update_from)
+                               and iteration < getattr(opt, "add_gaussian_until", opt.update_until))
+        error_map = None
+        if (opt.use_error_aware_refinement or add_gaussian_active) and iteration < opt.update_until and iteration > opt.start_stat:
             error_map = build_refinement_error_map(image, gt_image, opt)
+        if opt.use_error_aware_refinement and error_map is not None:
             neural_errors, neural_error_filter = sample_neural_gaussian_errors(
                 viewpoint_cam, render_pkg["neural_xyz"], visibility_filter, error_map, opt
+            )
+        if add_gaussian_active and error_map is not None:
+            add_gaussian_candidate_xyz = build_add_gaussian_candidates(
+                viewpoint_cam,
+                render_pkg["neural_xyz"],
+                visibility_filter,
+                error_map,
+                opt,
+                gaussians.get_finest_voxel_size(),
             )
         component_loss = image.new_tensor(0.0)
         if component_active and iteration < opt.update_until and iteration > opt.start_stat:
@@ -611,10 +667,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     component_proposal_scores=component_proposal_scores,
                     component_proposal_filter=component_proposal_filter,
                     component_candidate_xyz=component_candidate_xyz,
+                    add_gaussian_candidate_xyz=add_gaussian_candidate_xyz,
+                    add_gaussian_view_uid=viewpoint_cam.uid,
                 )
                 
                 # densification
-                if iteration > opt.update_from and iteration % opt.update_interval == 0:
+                add_gaussian_due = (getattr(opt, "use_add_gaussian", False)
+                                    and iteration >= getattr(opt, "add_gaussian_start", opt.update_from)
+                                    and iteration % max(1, int(getattr(opt, "add_gaussian_interval", opt.update_interval))) == 0)
+                if iteration > opt.update_from and (iteration % opt.update_interval == 0 or add_gaussian_due):
                     gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity)
             elif iteration == opt.update_until:
                 del gaussians.opacity_accum
@@ -634,6 +695,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     del gaussians.offset_component_proposal_accum
                     del gaussians.offset_component_proposal_denom
                     gaussians.component_candidate_xyz = torch.empty((0, 3), device="cuda")
+                if getattr(gaussians, "use_add_gaussian", False):
+                    gaussians.add_gaussian_pending_grid = torch.empty((0, 3), dtype=torch.int32, device="cuda")
+                    gaussians.add_gaussian_pending_votes = torch.empty((0, 1), dtype=torch.int32, device="cuda")
+                    gaussians.add_gaussian_pending_last_uid = torch.empty((0, 1), dtype=torch.long, device="cuda")
                 torch.cuda.empty_cache()
                     
             # Optimizer step

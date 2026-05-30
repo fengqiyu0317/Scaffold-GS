@@ -158,6 +158,20 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
+        # Optional AddGaussian-style anchor exploration. New anchors are sampled
+        # from high-error visible neural Gaussians and inserted after repeated
+        # candidate observations.
+        self.use_add_gaussian = False
+        self.add_gaussian_start = 3000
+        self.add_gaussian_until = 15000
+        self.add_gaussian_interval = 500
+        self.add_gaussian_budget_per_interval = 256
+        self.add_gaussian_max_anchor_ratio = 1.10
+        self.add_gaussian_jitter_voxels = 1.0
+        self.add_gaussian_min_votes = 2
+        self.add_gaussian_candidate_multiplier = 4
+        self.add_gaussian_pending_limit = 4096
+
         # Optional error-aware anchor refinement. Disabled by default to keep
         # the original Scaffold-GS baseline unchanged.
         self.use_error_aware_refinement = False
