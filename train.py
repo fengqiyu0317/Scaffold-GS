@@ -285,46 +285,98 @@ def sample_neural_gaussian_errors(viewpoint_camera, neural_xyz, visibility_filte
     return errors, valid_mask
 
 
-def build_add_gaussian_candidates(viewpoint_camera, neural_xyz, visibility_filter, error_map, opt, voxel_size):
+def build_add_gaussian_candidates(viewpoint_camera, neural_xyz, visibility_filter, error_map, opt, voxel_size, anchor_xyz=None):
+    mode = getattr(opt, "add_gaussian_mode", "error_neighbor")
+    valid_modes = {"error_neighbor", "error_random", "visible_random", "surface_random", "global_random"}
+    if mode not in valid_modes:
+        mode = "error_neighbor"
+
+    device = neural_xyz.device if neural_xyz.numel() > 0 else error_map.device
+    dtype = neural_xyz.dtype if neural_xyz.numel() > 0 else error_map.dtype
+    empty = torch.zeros((0, 3), dtype=dtype, device=device)
+    budget = max(1, int(getattr(opt, "add_gaussian_budget_per_interval", 256)))
+    multiplier = max(1, int(getattr(opt, "add_gaussian_candidate_multiplier", 4)))
+
+    if mode == "global_random":
+        bbox_source = anchor_xyz.detach() if anchor_xyz is not None and anchor_xyz.numel() > 0 else neural_xyz.detach()
+        if bbox_source.numel() == 0:
+            return empty
+        lower = bbox_source.min(dim=0)[0]
+        upper = bbox_source.max(dim=0)[0]
+        extent = (upper - lower).clamp_min(float(voxel_size))
+        margin = max(0.0, float(getattr(opt, "add_gaussian_global_bbox_margin", 0.05)))
+        lower = lower - extent * margin
+        upper = upper + extent * margin
+        proposal_count = budget * multiplier
+        return lower + torch.rand((proposal_count, 3), dtype=bbox_source.dtype, device=bbox_source.device) * (upper - lower)
+
     if neural_xyz.numel() == 0:
-        return torch.zeros((0, 3), dtype=error_map.dtype, device=error_map.device)
+        return empty
 
-    errors, valid_filter = sample_neural_gaussian_errors(
-        viewpoint_camera, neural_xyz, visibility_filter, error_map, opt
-    )
-    errors = errors.detach().view(-1)
-    candidate_filter = valid_filter.detach() & visibility_filter.detach() & torch.isfinite(errors)
-    if candidate_filter.sum() == 0:
-        return torch.zeros((0, 3), dtype=error_map.dtype, device=error_map.device)
+    visible_filter = visibility_filter.detach()
+    source = getattr(opt, "add_gaussian_source", "visible_neural")
+    if source != "visible_neural":
+        source = "visible_neural"
 
-    candidate_errors = errors[candidate_filter].clamp_min(0.0)
-    positive = candidate_errors > candidate_errors.mean().clamp_min(1e-8)
-    if positive.sum() == 0:
-        positive = candidate_errors > 0
-    if positive.sum() == 0:
-        return torch.zeros((0, 3), dtype=error_map.dtype, device=error_map.device)
+    if mode in {"error_neighbor", "error_random"}:
+        errors, valid_filter = sample_neural_gaussian_errors(
+            viewpoint_camera, neural_xyz, visibility_filter, error_map, opt
+        )
+        errors = errors.detach().view(-1)
+        candidate_filter = valid_filter.detach() & visible_filter & torch.isfinite(errors)
+        if candidate_filter.sum() == 0:
+            return empty
 
-    candidate_indices = torch.nonzero(candidate_filter, as_tuple=False).view(-1)[positive]
-    weights = candidate_errors[positive].clamp_min(1e-8)
-    source_budget = max(1, int(getattr(opt, "add_gaussian_budget_per_interval", 256)))
-    if candidate_indices.shape[0] > source_budget:
-        sampled = torch.multinomial(weights, source_budget, replacement=False)
-        candidate_indices = candidate_indices[sampled]
+        candidate_errors = errors[candidate_filter].clamp_min(0.0)
+        positive = candidate_errors > candidate_errors.mean().clamp_min(1e-8)
+        if positive.sum() == 0:
+            positive = candidate_errors > 0
+        if positive.sum() == 0:
+            return empty
 
-    source_grid = torch.round(neural_xyz.detach()[candidate_indices] / float(voxel_size)).int()
-    neighbor_offsets = source_grid.new_tensor([
-        [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1],
-        [1, 1, 0], [1, -1, 0], [-1, 1, 0], [-1, -1, 0],
-        [1, 0, 1], [1, 0, -1], [-1, 0, 1], [-1, 0, -1],
-        [0, 1, 1], [0, 1, -1], [0, -1, 1], [0, -1, -1],
-        [1, 1, 1], [1, 1, -1], [1, -1, 1], [1, -1, -1],
-        [-1, 1, 1], [-1, 1, -1], [-1, -1, 1], [-1, -1, -1],
-    ])
-    neighbor_count = min(neighbor_offsets.shape[0], max(1, int(getattr(opt, "add_gaussian_candidate_multiplier", 4))))
-    proposal_grid = source_grid[:, None, :] + neighbor_offsets[:neighbor_count][None, :, :]
-    proposal_grid = torch.unique(proposal_grid.reshape(-1, 3), dim=0)
-    return proposal_grid.float() * float(voxel_size)
+        candidate_indices = torch.nonzero(candidate_filter, as_tuple=False).view(-1)[positive]
+        weights = candidate_errors[positive].clamp_min(1e-8)
+    else:
+        candidate_filter = visible_filter
+        if candidate_filter.sum() == 0:
+            return empty
+        candidate_indices = torch.nonzero(candidate_filter, as_tuple=False).view(-1)
+        weights = torch.ones((candidate_indices.shape[0],), dtype=neural_xyz.dtype, device=neural_xyz.device)
 
+    if mode == "error_neighbor":
+        source_budget = budget
+        if candidate_indices.shape[0] > source_budget:
+            sampled = torch.multinomial(weights, source_budget, replacement=False)
+            candidate_indices = candidate_indices[sampled]
+
+        source_grid = torch.round(neural_xyz.detach()[candidate_indices] / float(voxel_size)).int()
+        neighbor_offsets = source_grid.new_tensor([
+            [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1],
+            [1, 1, 0], [1, -1, 0], [-1, 1, 0], [-1, -1, 0],
+            [1, 0, 1], [1, 0, -1], [-1, 0, 1], [-1, 0, -1],
+            [0, 1, 1], [0, 1, -1], [0, -1, 1], [0, -1, -1],
+            [1, 1, 1], [1, 1, -1], [1, -1, 1], [1, -1, -1],
+            [-1, 1, 1], [-1, 1, -1], [-1, -1, 1], [-1, -1, -1],
+        ])
+        neighbor_count = min(neighbor_offsets.shape[0], multiplier)
+        proposal_grid = source_grid[:, None, :] + neighbor_offsets[:neighbor_count][None, :, :]
+        proposal_grid = torch.unique(proposal_grid.reshape(-1, 3), dim=0)
+        return proposal_grid.float() * float(voxel_size)
+
+    proposal_count = budget * multiplier
+    replacement = candidate_indices.shape[0] < proposal_count
+    sampled = torch.multinomial(weights, proposal_count, replacement=replacement)
+    source_xyz = neural_xyz.detach()[candidate_indices[sampled]]
+
+    radius_voxels = float(getattr(opt, "add_gaussian_random_radius_voxels", 10.0))
+    radius = max(0.0, radius_voxels) * float(voxel_size)
+    if radius <= 0.0:
+        return source_xyz
+
+    directions = torch.randn_like(source_xyz)
+    directions = directions / directions.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    distances = torch.rand((source_xyz.shape[0], 1), dtype=source_xyz.dtype, device=source_xyz.device).pow(1.0 / 3.0) * radius
+    return source_xyz + directions * distances
 
 def project_points_to_image(viewpoint_camera, xyz):
     if xyz.numel() == 0:
@@ -612,6 +664,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 error_map,
                 opt,
                 gaussians.get_finest_voxel_size(),
+                anchor_xyz=gaussians.get_anchor,
             )
         component_loss = image.new_tensor(0.0)
         if component_active and iteration < opt.update_until and iteration > opt.start_stat:

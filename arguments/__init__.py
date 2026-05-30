@@ -171,6 +171,10 @@ class OptimizationParams(ParamGroup):
         self.add_gaussian_min_votes = 2
         self.add_gaussian_candidate_multiplier = 4
         self.add_gaussian_pending_limit = 4096
+        self.add_gaussian_mode = "error_neighbor"
+        self.add_gaussian_random_radius_voxels = 10.0
+        self.add_gaussian_global_bbox_margin = 0.05
+        self.add_gaussian_source = "visible_neural"
 
         # Optional error-aware anchor refinement. Disabled by default to keep
         # the original Scaffold-GS baseline unchanged.

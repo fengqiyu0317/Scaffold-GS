@@ -175,6 +175,8 @@ class GaussianModel:
         self.add_gaussian_jitter_voxels = 1.0
         self.add_gaussian_min_votes = 2
         self.add_gaussian_pending_limit = 4096
+        self.add_gaussian_anchor_reference_count = 0
+        self.add_gaussian_inserted_count = 0
         self.add_gaussian_pending_grid = torch.empty(0)
         self.add_gaussian_pending_votes = torch.empty(0)
         self.add_gaussian_pending_last_uid = torch.empty(0)
@@ -394,6 +396,8 @@ class GaussianModel:
         self.add_gaussian_jitter_voxels = getattr(training_args, "add_gaussian_jitter_voxels", 1.0)
         self.add_gaussian_min_votes = getattr(training_args, "add_gaussian_min_votes", 2)
         self.add_gaussian_pending_limit = getattr(training_args, "add_gaussian_pending_limit", 4096)
+        self.add_gaussian_anchor_reference_count = 0
+        self.add_gaussian_inserted_count = 0
         self.initial_anchor_count = self.get_anchor.shape[0]
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
@@ -1112,12 +1116,15 @@ class GaussianModel:
 
         added_from_add_gaussian = 0
         if self.use_add_gaussian and self.add_gaussian_pending_grid.numel() > 0:
-            max_total_add_anchors = max(self.get_anchor.shape[0], int(self.initial_anchor_count * self.add_gaussian_max_anchor_ratio))
-            remaining_add_budget = max_total_add_anchors - self.get_anchor.shape[0]
-            interval_add_budget = min(int(self.add_gaussian_budget_per_interval), max(0, remaining_add_budget))
+            if self.add_gaussian_anchor_reference_count <= 0:
+                self.add_gaussian_anchor_reference_count = int(self.get_anchor.shape[0])
+            add_ratio_budget = max(0, int(self.add_gaussian_anchor_reference_count * (self.add_gaussian_max_anchor_ratio - 1.0)))
+            remaining_add_budget = max(0, add_ratio_budget - int(self.add_gaussian_inserted_count))
+            interval_add_budget = min(int(self.add_gaussian_budget_per_interval), remaining_add_budget)
             added_from_add_gaussian = self.add_pending_add_gaussian_anchors(max_new_anchors=interval_add_budget)
+            self.add_gaussian_inserted_count += int(added_from_add_gaussian)
             if added_from_add_gaussian > 0 or self.add_gaussian_pending_grid.numel() > 0:
-                print(f"[add_gaussian] pending={self.add_gaussian_pending_grid.shape[0]} added={added_from_add_gaussian} anchors={self.get_anchor.shape[0]}")
+                print(f"[add_gaussian] pending={self.add_gaussian_pending_grid.shape[0]} added={added_from_add_gaussian} add_total={self.add_gaussian_inserted_count} anchors={self.get_anchor.shape[0]}")
 
         if self.use_error_aware_refinement:
             self.offset_error_accum[offset_mask] = 0
