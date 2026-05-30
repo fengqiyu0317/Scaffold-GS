@@ -123,6 +123,11 @@ class GaussianModel:
         self.tree_geometry_hard_factor = 2.0
         self.tree_geometry_min_children = 3
 
+        self.tree_candidate_expand_mode = "none"
+        self.tree_candidate_expand_ratio = 1.0
+        self.tree_candidate_directional_top_ratio = 0.5
+        self.tree_grow_filter_stats = {}
+
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -572,6 +577,58 @@ class GaussianModel:
         soft_penalty[outside] = 1.0 / (1.0 + float(self.tree_geometry_weight) * (ratio[outside] - 1.0))
         return candidate_scores * soft_penalty, geometry_keep
 
+    def _expand_tree_candidate_xyz(self, selected_xyz, selected_parent_ids, selected_scores, cur_size):
+        mode = str(getattr(self, "tree_candidate_expand_mode", "none")).lower()
+        if (not self.use_tree_anchor_refinement) or mode == "none":
+            return selected_xyz, selected_parent_ids, selected_scores
+        if mode not in ("offset_scale", "directional_ring"):
+            raise ValueError(f"Unsupported tree_candidate_expand_mode: {mode}")
+
+        parent_xyz = self.get_anchor[selected_parent_ids].detach()
+        candidate_delta = selected_xyz - parent_xyz
+
+        if mode == "offset_scale":
+            ratio = max(float(self.tree_candidate_expand_ratio), 0.0)
+            expanded_xyz = parent_xyz + candidate_delta * ratio
+            return expanded_xyz, selected_parent_ids, selected_scores
+
+        top_ratio = max(0.0, min(float(self.tree_candidate_directional_top_ratio), 1.0))
+        if selected_xyz.shape[0] == 0 or top_ratio <= 0.0:
+            return selected_xyz, selected_parent_ids, selected_scores
+
+        top_count = max(1, int(selected_scores.shape[0] * top_ratio))
+        top_count = min(top_count, selected_scores.shape[0])
+        top_ids = torch.topk(selected_scores, top_count).indices
+        top_delta = candidate_delta[top_ids]
+        top_norm = torch.norm(top_delta, dim=1, keepdim=True)
+        valid = top_norm.squeeze(1) > 1e-6
+        if valid.sum() == 0:
+            return selected_xyz, selected_parent_ids, selected_scores
+
+        top_ids = top_ids[valid]
+        direction = top_delta[valid] / top_norm[valid].clamp_min(1e-6)
+        top_parent_xyz = parent_xyz[top_ids]
+        ring_xyz = torch.cat([
+            top_parent_xyz + direction * float(cur_size),
+            top_parent_xyz + direction * float(cur_size) * 2.0,
+        ], dim=0)
+        ring_parent_ids = selected_parent_ids[top_ids].repeat(2)
+        ring_scores = selected_scores[top_ids].repeat(2)
+        return (
+            torch.cat([selected_xyz, ring_xyz], dim=0),
+            torch.cat([selected_parent_ids, ring_parent_ids], dim=0),
+            torch.cat([selected_scores, ring_scores], dim=0),
+        )
+
+    def _record_tree_grow_stat(self, name, value):
+        if not hasattr(self, "tree_grow_filter_stats"):
+            self.tree_grow_filter_stats = {}
+        if torch.is_tensor(value):
+            value = int(value.detach().item())
+        else:
+            value = int(value)
+        self.tree_grow_filter_stats[name] = self.tree_grow_filter_stats.get(name, 0) + value
+
     def _remap_anchor_tree_after_prune(self, prune_mask):
         self._ensure_anchor_tree()
         valid_points_mask = ~prune_mask
@@ -614,6 +671,30 @@ class GaussianModel:
                 "leaf_anchor_count": int((self.anchor_children_count == 0).sum().item()),
                 "root_anchor_count": int((self.anchor_parent < 0).sum().item()),
             }
+            child_mask = self.anchor_parent >= 0
+            if child_mask.sum() > 0:
+                child_ids = torch.nonzero(child_mask, as_tuple=False).squeeze(1)
+                parent_ids = self.anchor_parent[child_ids]
+                child_distance = torch.norm(
+                    self.get_anchor[child_ids].detach().float() - self.get_anchor[parent_ids].detach().float(),
+                    dim=1,
+                )
+                qs = torch.quantile(
+                    child_distance,
+                    torch.tensor([0.5, 0.9, 0.95, 0.99], dtype=torch.float32, device=child_distance.device),
+                )
+                voxel = max(float(self.voxel_size), 1e-6)
+                payload["child_distance"] = {
+                    "mean": float(child_distance.mean().item()),
+                    "p50": float(qs[0].item()),
+                    "p90": float(qs[1].item()),
+                    "p95": float(qs[2].item()),
+                    "p99": float(qs[3].item()),
+                    "max": float(child_distance.max().item()),
+                    "mean_over_voxel_size": float((child_distance / voxel).mean().item()),
+                }
+            if hasattr(self, "tree_grow_filter_stats") and self.tree_grow_filter_stats:
+                payload["tree_grow_filter_stats"] = dict(self.tree_grow_filter_stats)
         with open(stats_path, "w") as fp:
             json.dump(payload, fp, indent=2)
 
@@ -648,6 +729,11 @@ class GaussianModel:
         self.tree_geometry_max_zscore = getattr(training_args, "tree_geometry_max_zscore", 2.5)
         self.tree_geometry_hard_factor = getattr(training_args, "tree_geometry_hard_factor", 2.0)
         self.tree_geometry_min_children = getattr(training_args, "tree_geometry_min_children", 3)
+        self.tree_candidate_expand_mode = str(getattr(training_args, "tree_candidate_expand_mode", "none")).lower()
+        if self.tree_candidate_expand_mode not in ("none", "offset_scale", "directional_ring"):
+            raise ValueError(f"Unsupported tree_candidate_expand_mode: {self.tree_candidate_expand_mode}")
+        self.tree_candidate_expand_ratio = getattr(training_args, "tree_candidate_expand_ratio", 1.0)
+        self.tree_candidate_directional_top_ratio = getattr(training_args, "tree_candidate_directional_top_ratio", 0.5)
         self._ensure_anchor_tree()
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
@@ -1025,10 +1111,6 @@ class GaussianModel:
             
             grid_coords = torch.round(self.get_anchor / cur_size).int()
 
-            selected_xyz = all_xyz.view([-1, 3])[candidate_mask]
-            selected_grid_coords = torch.round(selected_xyz / cur_size).int()
-
-            selected_grid_coords_unique, inverse_indices = torch.unique(selected_grid_coords, return_inverse=True, dim=0)
             selected_offset_ids = torch.nonzero(candidate_mask, as_tuple=False).squeeze(1)
             selected_parent_ids = torch.div(selected_offset_ids, self.n_offsets, rounding_mode="floor").long()
             score_source = grads if source_scores is None else source_scores
@@ -1038,6 +1120,18 @@ class GaussianModel:
                     torch.full((candidate_mask.shape[0] - score_source.shape[0],), -1e9, dtype=score_source.dtype, device=score_source.device),
                 ], dim=0)
             selected_scores = score_source[:candidate_mask.shape[0]][candidate_mask].float()
+            selected_xyz = all_xyz.view([-1, 3])[candidate_mask]
+            original_selected_count = selected_xyz.shape[0]
+            selected_xyz, selected_parent_ids, selected_scores = self._expand_tree_candidate_xyz(
+                selected_xyz, selected_parent_ids, selected_scores, cur_size
+            )
+            if self.use_tree_anchor_refinement:
+                self._record_tree_grow_stat("raw_offset_candidates", original_selected_count)
+                self._record_tree_grow_stat("expanded_position_candidates", selected_xyz.shape[0])
+            selected_grid_coords = torch.round(selected_xyz / cur_size).int()
+            selected_grid_coords_unique, inverse_indices = torch.unique(selected_grid_coords, return_inverse=True, dim=0)
+            if self.use_tree_anchor_refinement:
+                self._record_tree_grow_stat("unique_voxel_candidates", selected_grid_coords_unique.shape[0])
             _, best_local = scatter_max(selected_scores, inverse_indices, dim=0)
             best_parent = selected_parent_ids[best_local]
             best_scores = selected_scores[best_local]
@@ -1058,9 +1152,13 @@ class GaussianModel:
                 remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords).all(-1).any(-1).view(-1)
 
             remove_duplicates = ~remove_duplicates
+            if self.use_tree_anchor_refinement:
+                self._record_tree_grow_stat("duplicate_voxel_rejects", remove_duplicates.numel() - remove_duplicates.sum())
             candidate_anchor = selected_grid_coords_unique[remove_duplicates]*cur_size
             new_parent = best_parent[remove_duplicates]
             candidate_scores = best_scores[remove_duplicates]
+            if self.use_tree_anchor_refinement:
+                self._record_tree_grow_stat("post_duplicate_candidates", candidate_anchor.shape[0])
 
             if self.use_tree_anchor_refinement and candidate_anchor.shape[0] > 0:
                 parent_depth = self.anchor_depth[new_parent].long()
@@ -1069,6 +1167,10 @@ class GaussianModel:
                 child_cap = self._compute_effective_child_cap(new_parent, tree_stats)
                 budget_ok = self.anchor_children_count[new_parent] < child_cap
                 keep = torch.logical_and(torch.logical_and(depth_ok, budget_ok), geometry_ok)
+                self._record_tree_grow_stat("depth_rejects", (~depth_ok).sum())
+                self._record_tree_grow_stat("budget_rejects", (~budget_ok).sum())
+                self._record_tree_grow_stat("geometry_rejects", (~geometry_ok).sum())
+                before_parent_trim = keep.sum()
                 if keep.sum() > 0:
                     final_keep = torch.zeros_like(keep)
                     for parent in torch.unique(new_parent[keep]):
@@ -1082,9 +1184,11 @@ class GaussianModel:
                             top_ids = torch.topk(candidate_scores[ids], remaining).indices
                             ids = ids[top_ids]
                         final_keep[ids] = True
+                    self._record_tree_grow_stat("parent_budget_trim_rejects", before_parent_trim - final_keep.sum())
                     keep = final_keep
                 candidate_anchor = candidate_anchor[keep]
                 new_parent = new_parent[keep]
+                self._record_tree_grow_stat("kept_tree_candidates", candidate_anchor.shape[0])
 
             
             if candidate_anchor.shape[0] > 0:

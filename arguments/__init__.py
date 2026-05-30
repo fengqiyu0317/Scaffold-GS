@@ -198,6 +198,13 @@ class OptimizationParams(ParamGroup):
         self.tree_geometry_hard_factor = 2.0
         self.tree_geometry_min_children = 3
 
+        # Optional V1.4 candidate expansion for tree growing. This changes only
+        # training-time anchor candidate positions before the existing voxel
+        # snapping, duplicate removal, depth, and budget filters.
+        self.tree_candidate_expand_mode = "none"
+        self.tree_candidate_expand_ratio = 1.0
+        self.tree_candidate_directional_top_ratio = 0.5
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
