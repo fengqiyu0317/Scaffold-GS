@@ -209,9 +209,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     viewpoint_cam, render_pkg["neural_xyz"], visibility_filter, highlight_error_map
                 )
         if hotspot_field is not None and error_map is not None and hotspot_field.should_update(iteration):
+            hotspot_opacity = None
+            if render_pkg.get("neural_opacity", None) is not None and render_pkg.get("selection_mask", None) is not None:
+                hotspot_opacity = render_pkg["neural_opacity"].detach()[render_pkg["selection_mask"].detach()]
             hotspot_field.update(
                 iteration, viewpoint_cam, image.detach(), gt_image.detach(),
-                render_pkg.get("neural_xyz", None), visibility_filter.detach()
+                render_pkg.get("neural_xyz", None), visibility_filter.detach(),
+                radii=render_pkg.get("radii", None), neural_opacity=hotspot_opacity
             )
         Ll1 = l1_loss(image, gt_image)
 

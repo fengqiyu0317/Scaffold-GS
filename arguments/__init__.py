@@ -193,6 +193,10 @@ class OptimizationParams(ParamGroup):
         self.hotspot_error_mean_multiplier = 1.5
         self.hotspot_max_pixels_per_view = 512
         self.hotspot_reproj_radius_px = 3.0
+        self.hotspot_attribution_mode = "center"
+        self.hotspot_depth_radius_cap_px = 3
+        self.hotspot_depth_min_weight = 1e-4
+        self.hotspot_depth_min_radii = 1.0
         self.hotspot_weight = 0.5
         self.hotspot_score_clip = 3.0
         self.hotspot_high_error_percentile = 95.0

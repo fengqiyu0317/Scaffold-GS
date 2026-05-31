@@ -63,6 +63,37 @@ def _view_diverse(view_dirs, min_angle_deg):
     return False, max_angle
 
 
+def _sample_mask_pixels(mask, score_map, max_pixels):
+    hit = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(1)
+    if hit.numel() == 0:
+        return None, None
+    k = min(int(max_pixels), int(hit.numel()))
+    scores = score_map.reshape(-1)[hit]
+    if hit.numel() > k:
+        hit = hit[torch.topk(scores, k=k).indices]
+    height, width = score_map.shape
+    y = torch.div(hit, width, rounding_mode="floor").long()
+    x = (hit - y * width).long()
+    return x, y
+
+
+def _view_depth(points, camera):
+    ones = torch.ones((points.shape[0], 1), dtype=points.dtype, device=points.device)
+    points_h = torch.cat([points, ones], dim=1)
+    view = points_h @ camera.world_view_transform
+    return view[:, 2]
+
+
+def _unproject_pixels_with_view_depth(px, py, depth, camera, height, width):
+    ndc_x = (px.float() / max(width - 1, 1)) * 2.0 - 1.0
+    ndc_y = 1.0 - (py.float() / max(height - 1, 1)) * 2.0
+    view_x = ndc_x * depth * math.tan(float(camera.FoVx) * 0.5)
+    view_y = ndc_y * depth * math.tan(float(camera.FoVy) * 0.5)
+    view = torch.stack([view_x, view_y, depth, torch.ones_like(depth)], dim=1)
+    world = view @ torch.inverse(camera.world_view_transform)
+    return world[:, :3] / (world[:, 3:4] + 1e-7)
+
+
 class ErrorHotspotField:
     def __init__(self, opt, voxel_size):
         self.voxel_size = float(voxel_size) * float(opt.hotspot_voxel_multiplier)
@@ -72,6 +103,10 @@ class ErrorHotspotField:
         self.grow_interval = int(opt.hotspot_grow_interval)
         self.max_pixels_per_view = int(opt.hotspot_max_pixels_per_view)
         self.reproj_radius_px = float(opt.hotspot_reproj_radius_px)
+        self.attribution_mode = str(getattr(opt, "hotspot_attribution_mode", "center")).lower()
+        self.depth_radius_cap_px = int(getattr(opt, "hotspot_depth_radius_cap_px", 3))
+        self.depth_min_weight = float(getattr(opt, "hotspot_depth_min_weight", 1e-4))
+        self.depth_min_radii = float(getattr(opt, "hotspot_depth_min_radii", 1.0))
         self.min_support_views = int(opt.hotspot_min_support_views)
         self.min_view_angle_deg = float(opt.hotspot_min_view_angle_deg)
         self.error_multiplier = float(opt.hotspot_error_mean_multiplier)
@@ -90,6 +125,8 @@ class ErrorHotspotField:
         self.global_error_pixels = 0
         self.sampled_pixels = 0
         self.matched_pixels = 0
+        self.depth_attributed_pixels = 0
+        self.center_attributed_pixels = 0
         self.last_active = []
         self.last_summary = {}
 
@@ -120,7 +157,7 @@ class ErrorHotspotField:
     def should_grow(self, iteration):
         return self.start <= iteration <= self.until and iteration % max(self.grow_interval, 1) == 0
 
-    def update(self, iteration, viewpoint_camera, render_image, gt_image, neural_xyz, visibility_filter):
+    def update(self, iteration, viewpoint_camera, render_image, gt_image, neural_xyz, visibility_filter, radii=None, neural_opacity=None):
         if neural_xyz is None or neural_xyz.numel() == 0:
             return
         rgb_error = torch.abs(render_image.detach() - gt_image.detach()).mean(dim=0)
@@ -133,21 +170,57 @@ class ErrorHotspotField:
         edges = _edge_response(gt_luma)
         thin_bright = (gt_luma > self.thin_luma_threshold) & (chroma < self.thin_chroma_max) & (edges > self.edge_threshold)
         score_map = rgb_error + highlight.float() * luma_deficit * 2.0 + thin_bright.float() * edges * 1.5
+        mask = high_error | highlight | thin_bright
         self.global_error_sum += float(rgb_error.sum().item())
         self.global_error_pixels += int(rgb_error.numel())
 
+        if self.attribution_mode == "footprint_depth":
+            self._update_footprint_depth(
+                iteration, viewpoint_camera, rgb_error, score_map, high_error, highlight, thin_bright,
+                mask, neural_xyz, visibility_filter, radii, neural_opacity
+            )
+        else:
+            self._update_center(
+                iteration, viewpoint_camera, rgb_error, score_map, high_error, highlight, thin_bright,
+                neural_xyz, visibility_filter
+            )
+
+    def _record_point(self, iteration, viewpoint_camera, point, x, y, rgb_error, score_map, high_error, highlight, thin_bright):
+        mask_code = 0
+        if bool(high_error[y, x].item()):
+            mask_code |= 1
+        if bool(highlight[y, x].item()):
+            mask_code |= 2
+        if bool(thin_bright[y, x].item()):
+            mask_code |= 4
+        point_np = point.detach().cpu().numpy() if torch.is_tensor(point) else point
+        key = self._key_tuple(point_np)
+        stat = self.stats[key]
+        stat["error_sum"] += float(score_map[y, x].item())
+        stat["rgb_error_sum"] += float(rgb_error[y, x].item())
+        stat["count"] += 1
+        view_name = str(viewpoint_camera.image_name)
+        stat["support_views"].add(view_name)
+        stat["last_seen_iter"] = int(iteration)
+        stat["mask_counts"].update([str(mask_code)])
+        if view_name not in stat["view_dirs"]:
+            cam_center = viewpoint_camera.camera_center.detach().cpu().numpy()
+            direction = cam_center - point_np
+            norm = float(np.linalg.norm(direction))
+            if norm > 1e-8:
+                stat["view_dirs"][view_name] = (direction / norm).astype(float).tolist()
+
+    def _update_center(self, iteration, viewpoint_camera, rgb_error, score_map, high_error, highlight, thin_bright, neural_xyz, visibility_filter):
         height, width = rgb_error.shape
         active = visibility_filter.detach()
         if active.sum() == 0:
             return
-        active_idx = torch.nonzero(active, as_tuple=False).squeeze(1)
         xyz = neural_xyz.detach()[active]
         px, py, valid = _project_points(xyz, viewpoint_camera, height, width)
         if valid is None or valid.sum() == 0:
             return
         px = px[valid]
         py = py[valid]
-        active_idx = active_idx[valid]
         xyz = xyz[valid]
         mask_hit = high_error[py, px] | highlight[py, px] | thin_bright[py, px]
         if mask_hit.sum() == 0:
@@ -158,35 +231,102 @@ class ErrorHotspotField:
         if hit_ids.numel() > k:
             hit_ids = hit_ids[torch.topk(hit_scores, k=k).indices]
         self.sampled_pixels += int(k)
-        cam_center = viewpoint_camera.camera_center.detach().cpu().numpy()
-        view_name = str(viewpoint_camera.image_name)
-        selected_xyz = xyz[hit_ids].detach().cpu().numpy()
+        selected_xyz = xyz[hit_ids]
         selected_px = px[hit_ids]
         selected_py = py[hit_ids]
         for local_i, point in enumerate(selected_xyz):
             x = int(selected_px[local_i].item())
             y = int(selected_py[local_i].item())
-            mask_code = 0
-            if bool(high_error[y, x].item()):
-                mask_code |= 1
-            if bool(highlight[y, x].item()):
-                mask_code |= 2
-            if bool(thin_bright[y, x].item()):
-                mask_code |= 4
-            key = self._key_tuple(point)
-            stat = self.stats[key]
-            stat["error_sum"] += float(score_map[y, x].item())
-            stat["rgb_error_sum"] += float(rgb_error[y, x].item())
-            stat["count"] += 1
-            stat["support_views"].add(view_name)
-            stat["last_seen_iter"] = int(iteration)
-            stat["mask_counts"].update([str(mask_code)])
-            if view_name not in stat["view_dirs"]:
-                direction = cam_center - point
-                norm = float(np.linalg.norm(direction))
-                if norm > 1e-8:
-                    stat["view_dirs"][view_name] = (direction / norm).astype(float).tolist()
+            self._record_point(iteration, viewpoint_camera, point, x, y, rgb_error, score_map, high_error, highlight, thin_bright)
             self.matched_pixels += 1
+            self.center_attributed_pixels += 1
+
+    def _update_footprint_depth(self, iteration, viewpoint_camera, rgb_error, score_map, high_error, highlight, thin_bright, mask, neural_xyz, visibility_filter, radii, neural_opacity):
+        if radii is None:
+            self._update_center(iteration, viewpoint_camera, rgb_error, score_map, high_error, highlight, thin_bright, neural_xyz, visibility_filter)
+            return
+        height, width = rgb_error.shape
+        sample_x, sample_y = _sample_mask_pixels(mask, score_map, self.max_pixels_per_view)
+        if sample_x is None:
+            return
+        sample_count = int(sample_x.numel())
+        self.sampled_pixels += sample_count
+
+        active = visibility_filter.detach()
+        if active.sum() == 0:
+            return
+        xyz = neural_xyz.detach()[active]
+        active_radii = radii.detach()[active].float()
+        if neural_opacity is not None and neural_opacity.numel() == neural_xyz.shape[0]:
+            active_opacity = neural_opacity.detach().reshape(-1)[active].float().clamp_min(0.0)
+        else:
+            active_opacity = torch.ones_like(active_radii, dtype=torch.float32)
+        px, py, valid = _project_points(xyz, viewpoint_camera, height, width)
+        if valid is None or valid.sum() == 0:
+            return
+        xyz = xyz[valid]
+        px = px[valid]
+        py = py[valid]
+        active_radii = active_radii[valid]
+        active_opacity = active_opacity[valid]
+        depth = _view_depth(xyz, viewpoint_camera).float()
+        valid_depth = torch.isfinite(depth) & (depth > float(getattr(viewpoint_camera, "znear", 0.01)))
+        if valid_depth.sum() == 0:
+            return
+        px = px[valid_depth]
+        py = py[valid_depth]
+        depth = depth[valid_depth]
+        active_radii = active_radii[valid_depth].clamp_min(float(self.depth_min_radii))
+        active_opacity = active_opacity[valid_depth]
+        radius = active_radii.clamp(max=max(float(self.depth_radius_cap_px), 1.0))
+
+        sample_index = torch.full((height, width), -1, dtype=torch.long, device=rgb_error.device)
+        sample_ids = torch.arange(sample_count, dtype=torch.long, device=rgb_error.device)
+        sample_index[sample_y, sample_x] = sample_ids
+        depth_num = torch.zeros(sample_count, dtype=torch.float32, device=rgb_error.device)
+        weight_sum = torch.zeros(sample_count, dtype=torch.float32, device=rgb_error.device)
+        cap = max(int(self.depth_radius_cap_px), 1)
+        for dy in range(-cap, cap + 1):
+            sy = py + dy
+            y_ok = (sy >= 0) & (sy < height)
+            if not bool(y_ok.any().item()):
+                continue
+            for dx in range(-cap, cap + 1):
+                sx = px + dx
+                ok = y_ok & (sx >= 0) & (sx < width)
+                if not bool(ok.any().item()):
+                    continue
+                sid = sample_index[sy[ok], sx[ok]]
+                hit = sid >= 0
+                if not bool(hit.any().item()):
+                    continue
+                local_radius = radius[ok][hit]
+                dist2 = float(dx * dx + dy * dy)
+                in_radius = dist2 <= (local_radius * local_radius)
+                if not bool(in_radius.any().item()):
+                    continue
+                sid = sid[hit][in_radius]
+                local_depth = depth[ok][hit][in_radius]
+                local_opacity = active_opacity[ok][hit][in_radius]
+                local_radius = local_radius[in_radius]
+                sigma = torch.clamp(local_radius * 0.5, min=1.0)
+                weight = local_opacity * torch.exp(torch.full_like(sigma, -dist2) / (2.0 * sigma * sigma))
+                depth_num.index_add_(0, sid, local_depth * weight)
+                weight_sum.index_add_(0, sid, weight)
+        valid_sample = weight_sum > self.depth_min_weight
+        if valid_sample.sum() == 0:
+            return
+        matched_x = sample_x[valid_sample]
+        matched_y = sample_y[valid_sample]
+        expected_depth = depth_num[valid_sample] / weight_sum[valid_sample].clamp_min(1e-8)
+        points = _unproject_pixels_with_view_depth(matched_x, matched_y, expected_depth, viewpoint_camera, height, width)
+        for local_i, point in enumerate(points):
+            x = int(matched_x[local_i].item())
+            y = int(matched_y[local_i].item())
+            self._record_point(iteration, viewpoint_camera, point, x, y, rgb_error, score_map, high_error, highlight, thin_bright)
+        matched = int(valid_sample.sum().item())
+        self.matched_pixels += matched
+        self.depth_attributed_pixels += matched
 
     def _anchor_key_counts(self, anchor_xyz):
         keys = self._key_tensor(anchor_xyz).detach().cpu().numpy()
@@ -222,6 +362,9 @@ class ErrorHotspotField:
             "active_hotspot_voxels": len(active),
             "sampled_pixels": self.sampled_pixels,
             "matched_pixels": self.matched_pixels,
+            "depth_attributed_pixels": self.depth_attributed_pixels,
+            "center_attributed_pixels": self.center_attributed_pixels,
+            "attribution_mode": self.attribution_mode,
             "global_mean_rgb_error": global_error,
         }
         return active
