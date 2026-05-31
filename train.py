@@ -486,7 +486,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist,
-                              dataset.use_viewdist_pe, dataset.view_pe_freqs, dataset.dist_pe_freqs, dataset.pe_include_input)
+                              dataset.use_viewdist_pe, dataset.view_pe_freqs, dataset.dist_pe_freqs, dataset.pe_include_input,
+                              dataset.ensemble_mode, dataset.num_appearance_experts, dataset.moe_top_k,
+                              dataset.ensemble_hidden_dim, dataset.ensemble_residual_scale, dataset.router_temperature)
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -570,11 +572,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 component_mask,
                 opt,
             )
+        ensemble_aux = render_pkg.get("ensemble_aux", {})
+        ensemble_loss = image.new_tensor(0.0)
+        if ensemble_aux:
+            ensemble_loss = ensemble_loss + getattr(opt, "lambda_moe_load_balance", 0.0) * ensemble_aux.get("moe_load_balance_loss", image.new_tensor(0.0))
+            ensemble_loss = ensemble_loss + getattr(opt, "lambda_gate_sparse", 0.0) * ensemble_aux.get("gate_sparse_loss", image.new_tensor(0.0))
+            ensemble_loss = ensemble_loss + getattr(opt, "lambda_residual_norm", 0.0) * ensemble_aux.get("residual_norm_loss", image.new_tensor(0.0))
+
         Ll1 = l1_loss(image, gt_image)
 
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg + component_loss
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg + component_loss + ensemble_loss
 
         loss.backward()
         
@@ -591,6 +600,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 progress_bar.close()
 
             # Log and save
+            if tb_writer and ensemble_aux and iteration % 100 == 0:
+                for aux_name, aux_value in ensemble_aux.items():
+                    if torch.is_tensor(aux_value):
+                        if aux_value.numel() == 1:
+                            tb_writer.add_scalar(f'{dataset_name}/ensemble/{aux_name}', aux_value.detach().item(), iteration)
+                        elif aux_name == "expert_usage":
+                            for expert_idx, usage_value in enumerate(aux_value.detach().flatten()):
+                                tb_writer.add_scalar(f'{dataset_name}/ensemble/expert_usage_{expert_idx}', usage_value.item(), iteration)
+                tb_writer.add_scalar(f'{dataset_name}/ensemble/ensemble_loss', ensemble_loss.detach().item(), iteration)
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -782,7 +800,9 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
     with torch.no_grad():
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist,
-                              dataset.use_viewdist_pe, dataset.view_pe_freqs, dataset.dist_pe_freqs, dataset.pe_include_input)
+                              dataset.use_viewdist_pe, dataset.view_pe_freqs, dataset.dist_pe_freqs, dataset.pe_include_input,
+                              dataset.ensemble_mode, dataset.num_appearance_experts, dataset.moe_top_k,
+                              dataset.ensemble_hidden_dim, dataset.ensemble_residual_scale, dataset.router_temperature)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
 

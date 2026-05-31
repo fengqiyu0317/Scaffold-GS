@@ -80,14 +80,15 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # get offset's color
     if pc.appearance_dim > 0:
         if pc.add_color_dist:
-            color = pc.get_color_mlp(torch.cat([cat_local_view, appearance], dim=1))
+            color_input = torch.cat([cat_local_view, appearance], dim=1)
         else:
-            color = pc.get_color_mlp(torch.cat([cat_local_view_wodist, appearance], dim=1))
+            color_input = torch.cat([cat_local_view_wodist, appearance], dim=1)
     else:
         if pc.add_color_dist:
-            color = pc.get_color_mlp(cat_local_view)
+            color_input = cat_local_view
         else:
-            color = pc.get_color_mlp(cat_local_view_wodist)
+            color_input = cat_local_view_wodist
+    color, ensemble_aux = pc.decode_color(color_input, return_aux=is_training)
     color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])# [mask]
 
     # get offset's cov
@@ -116,7 +117,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     xyz = repeat_anchor + offsets
 
     if is_training:
-        return xyz, color, opacity, scaling, rot, neural_opacity, mask, neural_offset_indices, neural_anchor_indices
+        return xyz, color, opacity, scaling, rot, neural_opacity, mask, neural_offset_indices, neural_anchor_indices, ensemble_aux
     else:
         return xyz, color, opacity, scaling, rot
 
@@ -129,7 +130,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     is_training = pc.get_color_mlp.training
         
     if is_training:
-        xyz, color, opacity, scaling, rot, neural_opacity, mask, neural_offset_indices, neural_anchor_indices = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, color, opacity, scaling, rot, neural_opacity, mask, neural_offset_indices, neural_anchor_indices, ensemble_aux = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     else:
         xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     
@@ -187,6 +188,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "neural_xyz": xyz,
                 "neural_offset_indices": neural_offset_indices,
                 "neural_anchor_indices": neural_anchor_indices,
+                "ensemble_aux": ensemble_aux,
                 }
     else:
         return {"render": rendered_image,

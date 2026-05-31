@@ -23,6 +23,7 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
+from scene.ensemble_decoder import GatedResidualAppearanceDecoder, MoEAppearanceDecoder
 
     
 class GaussianModel:
@@ -98,6 +99,12 @@ class GaussianModel:
                  view_pe_freqs : int = 4,
                  dist_pe_freqs : int = 3,
                  pe_include_input : bool = True,
+                 ensemble_mode : str = "none",
+                 num_appearance_experts : int = 3,
+                 moe_top_k : int = 2,
+                 ensemble_hidden_dim : int = 64,
+                 ensemble_residual_scale : float = 0.1,
+                 router_temperature : float = 1.0,
                  ):
 
         self.feat_dim = feat_dim
@@ -121,6 +128,13 @@ class GaussianModel:
         self.view_dim = self._encoded_dim(3, self.view_pe_freqs)
         self.dist_dim = self._encoded_dim(1, self.dist_pe_freqs)
         self.featurebank_input_dim = self.view_dim + self.dist_dim
+        self.ensemble_mode = str(ensemble_mode).lower()
+        self.num_appearance_experts = int(num_appearance_experts)
+        self.moe_top_k = int(moe_top_k)
+        self.ensemble_hidden_dim = int(ensemble_hidden_dim)
+        self.ensemble_residual_scale = float(ensemble_residual_scale)
+        self.router_temperature = float(router_temperature)
+        self.appearance_ensemble = None
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -196,12 +210,15 @@ class GaussianModel:
         ).cuda()
 
         self.color_dist_dim = self.dist_dim if self.add_color_dist else 0
+        self.color_input_dim = feat_dim + self.view_dim + self.color_dist_dim + self.appearance_dim
+        self.color_output_dim = 3 * self.n_offsets
         self.mlp_color = nn.Sequential(
-            nn.Linear(feat_dim+self.view_dim+self.color_dist_dim+self.appearance_dim, feat_dim),
+            nn.Linear(self.color_input_dim, feat_dim),
             nn.ReLU(True),
-            nn.Linear(feat_dim, 3*self.n_offsets),
+            nn.Linear(feat_dim, self.color_output_dim),
             nn.Sigmoid()
         ).cuda()
+        self._build_appearance_ensemble()
 
 
     def eval(self):
@@ -212,6 +229,8 @@ class GaussianModel:
             self.embedding_appearance.eval()
         if self.use_feat_bank:
             self.mlp_feature_bank.eval()
+        if self.appearance_ensemble is not None:
+            self.appearance_ensemble.eval()
 
     def train(self):
         self.mlp_opacity.train()
@@ -221,6 +240,8 @@ class GaussianModel:
             self.embedding_appearance.train()
         if self.use_feat_bank:                   
             self.mlp_feature_bank.train()
+        if self.appearance_ensemble is not None:
+            self.appearance_ensemble.train()
 
     def capture(self):
         return (
@@ -280,6 +301,36 @@ class GaussianModel:
     def get_color_mlp(self):
         return self.mlp_color
     
+    def _build_appearance_ensemble(self):
+        self.appearance_ensemble = None
+        if self.ensemble_mode in ["none", "self"]:
+            return
+        if self.ensemble_mode == "residual":
+            self.appearance_ensemble = GatedResidualAppearanceDecoder(
+                self.color_input_dim,
+                self.color_output_dim,
+                self.ensemble_hidden_dim,
+                self.ensemble_residual_scale,
+            ).cuda()
+        elif self.ensemble_mode == "moe":
+            self.appearance_ensemble = MoEAppearanceDecoder(
+                self.color_input_dim,
+                self.color_output_dim,
+                self.num_appearance_experts,
+                self.moe_top_k,
+                self.ensemble_hidden_dim,
+                self.ensemble_residual_scale,
+                self.router_temperature,
+            ).cuda()
+        else:
+            raise ValueError(f"Unknown ensemble_mode: {self.ensemble_mode}")
+
+    def decode_color(self, color_input, return_aux=False):
+        base_color = self.mlp_color(color_input)
+        if self.appearance_ensemble is None:
+            return base_color, {}
+        return self.appearance_ensemble(color_input, base_color, return_aux=return_aux)
+
     @property
     def get_rotation(self):
         return self.rotation_activation(self._rotation)
@@ -430,6 +481,9 @@ class GaussianModel:
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
             ]
 
+        if self.appearance_ensemble is not None:
+            l.append({'params': self.appearance_ensemble.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "appearance_ensemble"})
+
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -481,6 +535,9 @@ class GaussianModel:
                 lr = self.mlp_cov_scheduler_args(iteration)
                 param_group['lr'] = lr
             if param_group["name"] == "mlp_color":
+                lr = self.mlp_color_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if param_group["name"] == "appearance_ensemble":
                 lr = self.mlp_color_scheduler_args(iteration)
                 param_group['lr'] = lr
             if self.use_feat_bank and param_group["name"] == "mlp_featurebank":
@@ -588,7 +645,8 @@ class GaussianModel:
             if  'mlp' in group['name'] or \
                 'conv' in group['name'] or \
                 'feat_base' in group['name'] or \
-                'embedding' in group['name']:
+                'embedding' in group['name'] or \
+                group['name'] == 'appearance_ensemble':
                 continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
@@ -698,7 +756,8 @@ class GaussianModel:
             if  'mlp' in group['name'] or \
                 'conv' in group['name'] or \
                 'feat_base' in group['name'] or \
-                'embedding' in group['name']:
+                'embedding' in group['name'] or \
+                group['name'] == 'appearance_ensemble':
                 continue
 
             stored_state = self.optimizer.state.get(group['params'][0], None)
@@ -1195,28 +1254,22 @@ class GaussianModel:
                 emd.save(os.path.join(path, 'embedding_appearance.pt'))
                 self.embedding_appearance.train()
 
+            if self.appearance_ensemble is not None:
+                torch.save(self.appearance_ensemble.state_dict(), os.path.join(path, 'ensemble_decoder.pth'))
+
         elif mode == 'unite':
+            checkpoint = {
+                'opacity_mlp': self.mlp_opacity.state_dict(),
+                'cov_mlp': self.mlp_cov.state_dict(),
+                'color_mlp': self.mlp_color.state_dict(),
+            }
             if self.use_feat_bank:
-                torch.save({
-                    'opacity_mlp': self.mlp_opacity.state_dict(),
-                    'cov_mlp': self.mlp_cov.state_dict(),
-                    'color_mlp': self.mlp_color.state_dict(),
-                    'feature_bank_mlp': self.mlp_feature_bank.state_dict(),
-                    'appearance': self.embedding_appearance.state_dict()
-                    }, os.path.join(path, 'checkpoints.pth'))
-            elif self.appearance_dim > 0:
-                torch.save({
-                    'opacity_mlp': self.mlp_opacity.state_dict(),
-                    'cov_mlp': self.mlp_cov.state_dict(),
-                    'color_mlp': self.mlp_color.state_dict(),
-                    'appearance': self.embedding_appearance.state_dict()
-                    }, os.path.join(path, 'checkpoints.pth'))
-            else:
-                torch.save({
-                    'opacity_mlp': self.mlp_opacity.state_dict(),
-                    'cov_mlp': self.mlp_cov.state_dict(),
-                    'color_mlp': self.mlp_color.state_dict(),
-                    }, os.path.join(path, 'checkpoints.pth'))
+                checkpoint['feature_bank_mlp'] = self.mlp_feature_bank.state_dict()
+            if self.appearance_dim > 0:
+                checkpoint['appearance'] = self.embedding_appearance.state_dict()
+            if self.appearance_ensemble is not None:
+                checkpoint['ensemble_decoder'] = self.appearance_ensemble.state_dict()
+            torch.save(checkpoint, os.path.join(path, 'checkpoints.pth'))
         else:
             raise NotImplementedError
 
@@ -1230,6 +1283,12 @@ class GaussianModel:
                 self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
             if self.appearance_dim > 0:
                 self.embedding_appearance = torch.jit.load(os.path.join(path, 'embedding_appearance.pt')).cuda()
+            if self.appearance_ensemble is not None:
+                ensemble_path = os.path.join(path, 'ensemble_decoder.pth')
+                if os.path.exists(ensemble_path):
+                    self.appearance_ensemble.load_state_dict(torch.load(ensemble_path))
+                else:
+                    print(f"Warning: ensemble decoder checkpoint not found at {ensemble_path}")
         elif mode == 'unite':
             checkpoint = torch.load(os.path.join(path, 'checkpoints.pth'))
             self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
@@ -1239,5 +1298,10 @@ class GaussianModel:
                 self.mlp_feature_bank.load_state_dict(checkpoint['feature_bank_mlp'])
             if self.appearance_dim > 0:
                 self.embedding_appearance.load_state_dict(checkpoint['appearance'])
+            if self.appearance_ensemble is not None:
+                if 'ensemble_decoder' in checkpoint:
+                    self.appearance_ensemble.load_state_dict(checkpoint['ensemble_decoder'])
+                else:
+                    print("Warning: ensemble_decoder state not found in checkpoints.pth")
         else:
             raise NotImplementedError

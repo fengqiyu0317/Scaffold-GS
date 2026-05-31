@@ -79,6 +79,15 @@ class ModelParams(ParamGroup):
         self.view_pe_freqs = 4
         self.dist_pe_freqs = 3
         self.pe_include_input = True
+
+        # Optional appearance ensemble. Disabled by default to preserve the
+        # original Scaffold-GS color decoder path.
+        self.ensemble_mode = "none"
+        self.num_appearance_experts = 3
+        self.moe_top_k = 2
+        self.ensemble_hidden_dim = 64
+        self.ensemble_residual_scale = 0.1
+        self.router_temperature = 1.0
         
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -209,6 +218,14 @@ class OptimizationParams(ParamGroup):
         self.component_proposal_nms_kernel = 9
         self.component_ray_depth_samples = 3
         self.component_candidate_max_per_interval = 512
+
+        # Optional auxiliary losses for appearance ensemble experiments.
+        self.lambda_moe_load_balance = 0.001
+        self.lambda_moe_div = 0.0
+        self.lambda_self_ensemble = 0.0
+        self.self_ensemble_noise_std = 0.01
+        self.lambda_gate_sparse = 0.0
+        self.lambda_residual_norm = 0.0
 
         super().__init__(parser, "Optimization Parameters")
 
