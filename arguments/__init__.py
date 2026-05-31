@@ -188,15 +188,21 @@ class OptimizationParams(ParamGroup):
         self.hotspot_update_interval = 100
         self.hotspot_grow_interval = 500
         self.hotspot_voxel_multiplier = 4.0
-        self.hotspot_min_support_views = 3
+        self.hotspot_min_support_views = 2
         self.hotspot_min_view_angle_deg = 5.0
         self.hotspot_error_mean_multiplier = 1.5
-        self.hotspot_max_pixels_per_view = 512
-        self.hotspot_reproj_radius_px = 3.0
-        self.hotspot_attribution_mode = "center"
-        self.hotspot_depth_radius_cap_px = 3
+        self.hotspot_max_pixels_per_view = 768
+        self.hotspot_reproj_radius_px = 4.0
+        self.hotspot_attribution_mode = "footprint_depth"
+        self.hotspot_depth_radius_cap_px = 4
         self.hotspot_depth_min_weight = 1e-4
         self.hotspot_depth_min_radii = 1.0
+        self.hotspot_thin_min_support_views = 2
+        self.hotspot_highlight_min_support_views = 4
+        self.hotspot_general_min_support_views = 3
+        self.hotspot_thin_reproj_radius_px = 4.0
+        self.hotspot_highlight_reproj_radius_px = 2.5
+        self.hotspot_general_reproj_radius_px = 3.5
         self.hotspot_weight = 0.5
         self.hotspot_score_clip = 3.0
         self.hotspot_high_error_percentile = 95.0
@@ -205,10 +211,20 @@ class OptimizationParams(ParamGroup):
         self.hotspot_thin_luma_threshold = 0.45
         self.hotspot_thin_chroma_max = 0.12
         self.hotspot_edge_threshold = 0.08
-        self.hotspot_min_anchor_count = 4
-        self.hotspot_add_budget_per_interval = 128
+        self.hotspot_min_anchor_count = 8
+        self.hotspot_density_ratio_thresh = 0.7
+        self.hotspot_add_budget_per_interval = 256
         self.hotspot_add_min_votes = 2
-        self.hotspot_add_candidate_multiplier = 4
+        self.hotspot_add_candidate_multiplier = 6
+        self.hotspot_add_max_anchor_ratio = 1.10
+
+        # Compatibility aliases for the experiment command naming used in notes.
+        self.use_add_gaussian = False
+        self.add_gaussian_mode = "hotspot"
+        self.add_gaussian_budget_per_interval = -1
+        self.add_gaussian_candidate_multiplier = -1
+        self.add_gaussian_min_votes = -1
+        self.add_gaussian_max_anchor_ratio = -1.0
 
         super().__init__(parser, "Optimization Parameters")
 
@@ -232,4 +248,17 @@ def get_combined_args(parser : ArgumentParser):
     for k,v in vars(args_cmdline).items():
         if v != None:
             merged_dict[k] = v
-    return Namespace(**merged_dict)
+    args = Namespace(**merged_dict)
+    if getattr(args, "use_add_gaussian", False):
+        args.use_hotspot_field = True
+        if str(getattr(args, "add_gaussian_mode", "hotspot")).lower() in ("hotspot", "add_gaussian"):
+            args.hotspot_mode = "add_gaussian"
+    if int(getattr(args, "add_gaussian_budget_per_interval", -1)) >= 0:
+        args.hotspot_add_budget_per_interval = int(args.add_gaussian_budget_per_interval)
+    if int(getattr(args, "add_gaussian_candidate_multiplier", -1)) >= 0:
+        args.hotspot_add_candidate_multiplier = int(args.add_gaussian_candidate_multiplier)
+    if int(getattr(args, "add_gaussian_min_votes", -1)) >= 0:
+        args.hotspot_add_min_votes = int(args.add_gaussian_min_votes)
+    if float(getattr(args, "add_gaussian_max_anchor_ratio", -1.0)) > 0:
+        args.hotspot_add_max_anchor_ratio = float(args.add_gaussian_max_anchor_ratio)
+    return args

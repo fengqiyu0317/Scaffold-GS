@@ -139,6 +139,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
     hotspot_field = ErrorHotspotField(opt, dataset.voxel_size) if getattr(opt, "use_hotspot_field", False) else None
+    hotspot_base_anchor_count = int(gaussians.get_anchor.shape[0])
     hotspot_stats_dir = os.path.join(dataset.model_path, "hotspot_stats")
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -273,9 +274,20 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         hotspot_anchor_scores=hotspot_anchor_scores,
                     )
                     if hotspot_field is not None and str(opt.hotspot_mode).lower() == "add_gaussian" and hotspot_field.should_grow(iteration):
-                        candidate_anchor, candidate_parent, proposal_stats = hotspot_field.propose_candidates(
-                            gaussians.get_anchor.detach(), int(opt.hotspot_add_budget_per_interval)
-                        )
+                        max_ratio = float(getattr(opt, "hotspot_add_max_anchor_ratio", 1.10))
+                        max_extra = int(max(0.0, max_ratio - 1.0) * max(hotspot_base_anchor_count, 1))
+                        already_added = int(getattr(gaussians, "hotspot_grow_stats", {}).get("added_anchors", 0))
+                        remaining_budget = max_extra - already_added
+                        interval_budget = min(int(opt.hotspot_add_budget_per_interval), max(remaining_budget, 0))
+                        if interval_budget <= 0:
+                            proposal_stats = {"active": len(hotspot_field.last_active), "density_pass": 0, "proposed": 0, "budget_exhausted": True, "max_extra": max_extra}
+                            candidate_anchor, candidate_parent = None, None
+                        else:
+                            candidate_anchor, candidate_parent, proposal_stats = hotspot_field.propose_candidates(
+                                gaussians.get_anchor.detach(), interval_budget
+                            )
+                            proposal_stats["remaining_budget_before"] = int(remaining_budget)
+                            proposal_stats["max_extra"] = int(max_extra)
                         added = gaussians.add_hotspot_anchors(candidate_anchor, candidate_parent, cur_size=dataset.voxel_size)
                         proposal_stats["added"] = int(added)
                         logger.info("[ITER {}] Hotspot AddGaussian {}".format(iteration, proposal_stats))
@@ -594,6 +606,18 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--gpu", type=str, default = '-1')
     args = parser.parse_args(sys.argv[1:])
+    if getattr(args, "use_add_gaussian", False):
+        args.use_hotspot_field = True
+        if str(getattr(args, "add_gaussian_mode", "hotspot")).lower() in ("hotspot", "add_gaussian"):
+            args.hotspot_mode = "add_gaussian"
+    if int(getattr(args, "add_gaussian_budget_per_interval", -1)) >= 0:
+        args.hotspot_add_budget_per_interval = int(args.add_gaussian_budget_per_interval)
+    if int(getattr(args, "add_gaussian_candidate_multiplier", -1)) >= 0:
+        args.hotspot_add_candidate_multiplier = int(args.add_gaussian_candidate_multiplier)
+    if int(getattr(args, "add_gaussian_min_votes", -1)) >= 0:
+        args.hotspot_add_min_votes = int(args.add_gaussian_min_votes)
+    if float(getattr(args, "add_gaussian_max_anchor_ratio", -1.0)) > 0:
+        args.hotspot_add_max_anchor_ratio = float(args.add_gaussian_max_anchor_ratio)
     args.save_iterations.append(args.iterations)
 
     
