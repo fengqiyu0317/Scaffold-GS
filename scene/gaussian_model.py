@@ -489,6 +489,8 @@ class GaussianModel:
                 "leaf_anchor_count": int((self.anchor_children_count == 0).sum().item()),
                 "root_anchor_count": int((self.anchor_parent < 0).sum().item()),
             }
+        if hasattr(self, "hotspot_grow_stats") and self.hotspot_grow_stats:
+            payload["hotspot_grow_stats"] = dict(self.hotspot_grow_stats)
         with open(stats_path, "w") as fp:
             json.dump(payload, fp, indent=2)
 
@@ -511,6 +513,10 @@ class GaussianModel:
         self.highlight_grow_weight = getattr(training_args, "highlight_grow_weight", 0.5)
         self.highlight_error_norm_clip = getattr(training_args, "highlight_error_norm_clip", 3.0)
         self.highlight_tree_weight = getattr(training_args, "highlight_tree_weight", 0.5)
+        self.use_hotspot_field = getattr(training_args, "use_hotspot_field", False)
+        self.hotspot_weight = getattr(training_args, "hotspot_weight", 0.5)
+        self.hotspot_score_clip = getattr(training_args, "hotspot_score_clip", 3.0)
+        self.hotspot_grow_stats = {}
         self._ensure_anchor_tree()
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
@@ -1024,7 +1030,115 @@ class GaussianModel:
                 
 
 
-    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
+    def _pad_anchor_training_buffers(self, new_count):
+        if new_count <= 0:
+            return
+        device = self.get_anchor.device
+        self.anchor_demon = torch.cat([self.anchor_demon, torch.zeros((new_count, 1), device=device).float()], dim=0)
+        self.opacity_accum = torch.cat([self.opacity_accum, torch.zeros((new_count, 1), device=device).float()], dim=0)
+        zero_anchor = torch.zeros((new_count, 1), device=device).float()
+        self.anchor_error_accum = torch.cat([self.anchor_error_accum, zero_anchor.clone()], dim=0)
+        self.anchor_error_denom = torch.cat([self.anchor_error_denom, zero_anchor.clone()], dim=0)
+        self.anchor_highlight_error_accum = torch.cat([self.anchor_highlight_error_accum, zero_anchor.clone()], dim=0)
+        self.anchor_highlight_error_denom = torch.cat([self.anchor_highlight_error_denom, zero_anchor.clone()], dim=0)
+        zero_offsets = torch.zeros((new_count * self.n_offsets, 1), device=device).float()
+        self.offset_error_accum = torch.cat([self.offset_error_accum, zero_offsets.clone()], dim=0)
+        self.offset_error_denom = torch.cat([self.offset_error_denom, zero_offsets.clone()], dim=0)
+        self.offset_highlight_error_accum = torch.cat([self.offset_highlight_error_accum, zero_offsets.clone()], dim=0)
+        self.offset_highlight_error_denom = torch.cat([self.offset_highlight_error_denom, zero_offsets.clone()], dim=0)
+        self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, zero_offsets.clone()], dim=0)
+        self.offset_denom = torch.cat([self.offset_denom, zero_offsets.clone()], dim=0)
+
+    def add_hotspot_anchors(self, candidate_anchor, new_parent, cur_size=None):
+        self._ensure_anchor_tree()
+        if candidate_anchor is None or new_parent is None or candidate_anchor.numel() == 0:
+            return 0
+        candidate_anchor = candidate_anchor.detach().float().to(self.get_anchor.device)
+        new_parent = new_parent.detach().long().to(self.get_anchor.device)
+        cur_size = float(self.voxel_size if cur_size is None else cur_size)
+
+        grid_coords = torch.round(self.get_anchor / cur_size).int()
+        candidate_grid = torch.round(candidate_anchor / cur_size).int()
+        candidate_grid_unique, inverse_indices = torch.unique(candidate_grid, return_inverse=True, dim=0)
+        _, best_local = scatter_max(torch.arange(candidate_anchor.shape[0], device=candidate_anchor.device).float(), inverse_indices, dim=0)
+        candidate_anchor = candidate_grid_unique.float() * cur_size
+        new_parent = new_parent[best_local]
+
+        remove_duplicates_list = []
+        chunk_size = 4096
+        max_iters = grid_coords.shape[0] // chunk_size + (1 if grid_coords.shape[0] % chunk_size != 0 else 0)
+        for chunk_idx in range(max_iters):
+            existing = grid_coords[chunk_idx * chunk_size:(chunk_idx + 1) * chunk_size, :]
+            remove_duplicates_list.append((candidate_grid_unique.unsqueeze(1) == existing).all(-1).any(-1).view(-1))
+        duplicate = reduce(torch.logical_or, remove_duplicates_list) if remove_duplicates_list else torch.zeros(candidate_anchor.shape[0], dtype=torch.bool, device=candidate_anchor.device)
+        keep = ~duplicate
+
+        if self.use_tree_anchor_refinement and keep.sum() > 0:
+            parent_depth = self.anchor_depth[new_parent].long()
+            depth_ok = parent_depth + 1 <= int(self.tree_max_depth)
+            child_cap = torch.full_like(new_parent, int(self.tree_child_high_cap), dtype=torch.int32)
+            budget_ok = self.anchor_children_count[new_parent] < child_cap
+            keep = keep & depth_ok & budget_ok
+            if keep.sum() > 0:
+                final_keep = torch.zeros_like(keep)
+                for parent in torch.unique(new_parent[keep]):
+                    ids = torch.nonzero(torch.logical_and(keep, new_parent == parent), as_tuple=False).squeeze(1)
+                    remaining = int(self.tree_child_high_cap) - int(self.anchor_children_count[parent].item())
+                    if remaining <= 0:
+                        continue
+                    final_keep[ids[:remaining]] = True
+                keep = final_keep
+
+        candidate_anchor = candidate_anchor[keep]
+        new_parent = new_parent[keep]
+        added = int(candidate_anchor.shape[0])
+        self.hotspot_grow_stats["candidate_requests"] = self.hotspot_grow_stats.get("candidate_requests", 0) + int(candidate_grid.shape[0])
+        self.hotspot_grow_stats["added_anchors"] = self.hotspot_grow_stats.get("added_anchors", 0) + added
+        if added == 0:
+            return 0
+
+        new_scaling = torch.ones_like(candidate_anchor).repeat([1, 2]).float().cuda() * cur_size
+        new_scaling = torch.log(new_scaling)
+        new_rotation = torch.zeros((added, 4), device=candidate_anchor.device).float()
+        new_rotation[:, 0] = 1.0
+        new_opacities = inverse_sigmoid(0.1 * torch.ones((added, 1), dtype=torch.float, device=candidate_anchor.device))
+        new_feat = self._anchor_feat[new_parent]
+        new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).float().cuda()
+
+        d = {
+            "anchor": candidate_anchor,
+            "scaling": new_scaling,
+            "rotation": new_rotation,
+            "anchor_feat": new_feat,
+            "offset": new_offsets,
+            "opacity": new_opacities,
+        }
+        self._pad_anchor_training_buffers(added)
+        if self.use_tree_anchor_refinement:
+            new_depth = (self.anchor_depth[new_parent].long() + 1).int()
+            self.anchor_parent = torch.cat([self.anchor_parent, new_parent.long()], dim=0)
+            self.anchor_depth = torch.cat([self.anchor_depth, new_depth], dim=0)
+            self.anchor_children_count = torch.cat([
+                self.anchor_children_count,
+                torch.zeros(added, dtype=torch.int32, device=candidate_anchor.device),
+            ], dim=0)
+            self.anchor_children_count.scatter_add_(
+                0,
+                new_parent.long(),
+                torch.ones(added, dtype=torch.int32, device=candidate_anchor.device),
+            )
+        torch.cuda.empty_cache()
+        optimizable_tensors = self.cat_tensors_to_optimizer(d)
+        self._anchor = optimizable_tensors["anchor"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+        self._anchor_feat = optimizable_tensors["anchor_feat"]
+        self._offset = optimizable_tensors["offset"]
+        self._opacity = optimizable_tensors["opacity"]
+        return added
+
+
+    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005, hotspot_anchor_scores=None):
         # # adding anchors
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
@@ -1059,6 +1173,13 @@ class GaussianModel:
             anchor_factor = anchor_factor * depth_factor.clamp_min(0.1)
             offset_anchor_ids = torch.arange(self.get_anchor.shape[0], device="cuda").repeat_interleave(self.n_offsets)
             grow_scores = grow_scores * anchor_factor[offset_anchor_ids]
+
+        if self.use_hotspot_field and hotspot_anchor_scores is not None and hotspot_anchor_scores.numel() == self.get_anchor.shape[0]:
+            hotspot_scores = hotspot_anchor_scores.detach().float().clamp(min=0.0, max=float(self.hotspot_score_clip))
+            if hotspot_scores.max() > 0:
+                offset_anchor_ids = torch.arange(self.get_anchor.shape[0], device="cuda").repeat_interleave(self.n_offsets)
+                grow_scores = grow_scores * (1.0 + float(self.hotspot_weight) * hotspot_scores[offset_anchor_ids])
+                self.hotspot_grow_stats["score_modulated_intervals"] = self.hotspot_grow_stats.get("score_modulated_intervals", 0) + 1
         
         self.anchor_growing(grow_scores, grad_threshold, offset_mask, source_scores=grow_scores, tree_stats=tree_stats)
 

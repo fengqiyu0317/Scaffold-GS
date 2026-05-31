@@ -179,6 +179,33 @@ class OptimizationParams(ParamGroup):
         self.highlight_luma_threshold = 0.65
         self.highlight_local_contrast = 0.08
 
+        # Optional V1 hotspot-aware density control. The hotspot field is a
+        # training-only sparse 3D statistic and does not change rendering.
+        self.use_hotspot_field = False
+        self.hotspot_mode = "score_only"
+        self.hotspot_start = 3000
+        self.hotspot_until = 18000
+        self.hotspot_update_interval = 100
+        self.hotspot_grow_interval = 500
+        self.hotspot_voxel_multiplier = 4.0
+        self.hotspot_min_support_views = 3
+        self.hotspot_min_view_angle_deg = 5.0
+        self.hotspot_error_mean_multiplier = 1.5
+        self.hotspot_max_pixels_per_view = 512
+        self.hotspot_reproj_radius_px = 3.0
+        self.hotspot_weight = 0.5
+        self.hotspot_score_clip = 3.0
+        self.hotspot_high_error_percentile = 95.0
+        self.hotspot_highlight_luma_threshold = 0.65
+        self.hotspot_highlight_deficit_threshold = 0.05
+        self.hotspot_thin_luma_threshold = 0.45
+        self.hotspot_thin_chroma_max = 0.12
+        self.hotspot_edge_threshold = 0.08
+        self.hotspot_min_anchor_count = 4
+        self.hotspot_add_budget_per_interval = 128
+        self.hotspot_add_min_votes = 2
+        self.hotspot_add_candidate_multiplier = 4
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

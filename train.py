@@ -41,6 +41,7 @@ from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
+from utils.hotspot_utils import ErrorHotspotField
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 
@@ -137,6 +138,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
+    hotspot_field = ErrorHotspotField(opt, dataset.voxel_size) if getattr(opt, "use_hotspot_field", False) else None
+    hotspot_stats_dir = os.path.join(dataset.model_path, "hotspot_stats")
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -193,8 +196,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         neural_error_filter = None
         neural_highlight_errors = None
         neural_highlight_error_filter = None
-        if opt.use_error_aware_refinement and iteration < opt.update_until and iteration > opt.start_stat:
+        error_map = None
+        if (opt.use_error_aware_refinement or hotspot_field is not None) and iteration < opt.update_until and iteration > opt.start_stat:
             error_map = torch.abs(image.detach() - gt_image.detach()).mean(dim=0)
+        if opt.use_error_aware_refinement and error_map is not None:
             neural_errors, neural_error_filter = sample_neural_gaussian_errors(
                 viewpoint_cam, render_pkg["neural_xyz"], visibility_filter, error_map
             )
@@ -203,6 +208,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 neural_highlight_errors, neural_highlight_error_filter = sample_neural_gaussian_errors(
                     viewpoint_cam, render_pkg["neural_xyz"], visibility_filter, highlight_error_map
                 )
+        if hotspot_field is not None and error_map is not None and hotspot_field.should_update(iteration):
+            hotspot_field.update(
+                iteration, viewpoint_cam, image.detach(), gt_image.detach(),
+                render_pkg.get("neural_xyz", None), visibility_filter.detach()
+            )
         Ll1 = l1_loss(image, gt_image)
 
         ssim_loss = (1.0 - ssim(image, gt_image))
@@ -227,6 +237,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
+                if hotspot_field is not None:
+                    hotspot_field.rebuild_active(gaussians.get_anchor.detach())
+                    logger.info("[ITER {}] Hotspot summary {}".format(iteration, hotspot_field.last_summary))
+                    hotspot_field.write_summary(hotspot_stats_dir, iteration)
                 scene.save(iteration)
             
             # densification
@@ -244,7 +258,24 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 
                 # densification
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
-                    gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity)
+                    hotspot_anchor_scores = None
+                    if hotspot_field is not None:
+                        hotspot_anchor_scores = hotspot_field.query_anchor_scores(gaussians.get_anchor.detach())
+                    gaussians.adjust_anchor(
+                        check_interval=opt.update_interval,
+                        success_threshold=opt.success_threshold,
+                        grad_threshold=opt.densify_grad_threshold,
+                        min_opacity=opt.min_opacity,
+                        hotspot_anchor_scores=hotspot_anchor_scores,
+                    )
+                    if hotspot_field is not None and str(opt.hotspot_mode).lower() == "add_gaussian" and hotspot_field.should_grow(iteration):
+                        candidate_anchor, candidate_parent, proposal_stats = hotspot_field.propose_candidates(
+                            gaussians.get_anchor.detach(), int(opt.hotspot_add_budget_per_interval)
+                        )
+                        added = gaussians.add_hotspot_anchors(candidate_anchor, candidate_parent, cur_size=dataset.voxel_size)
+                        proposal_stats["added"] = int(added)
+                        logger.info("[ITER {}] Hotspot AddGaussian {}".format(iteration, proposal_stats))
+                        hotspot_field.write_summary(hotspot_stats_dir, iteration)
             elif iteration == opt.update_until:
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
@@ -259,6 +290,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     del gaussians.offset_highlight_error_denom
                     del gaussians.anchor_highlight_error_accum
                     del gaussians.anchor_highlight_error_denom
+                if hotspot_field is not None:
+                    hotspot_field.rebuild_active(gaussians.get_anchor.detach())
+                    hotspot_field.write_summary(hotspot_stats_dir, iteration)
                 torch.cuda.empty_cache()
                     
             # Optimizer step
