@@ -108,16 +108,6 @@ class ErrorHotspotField:
         self.depth_min_weight = float(getattr(opt, "hotspot_depth_min_weight", 1e-4))
         self.depth_min_radii = float(getattr(opt, "hotspot_depth_min_radii", 1.0))
         self.min_support_views = int(opt.hotspot_min_support_views)
-        self.type_support_views = {
-            "thin_bright_structure": int(getattr(opt, "hotspot_thin_min_support_views", self.min_support_views)),
-            "highlight_deficit": int(getattr(opt, "hotspot_highlight_min_support_views", self.min_support_views)),
-            "general_high_error": int(getattr(opt, "hotspot_general_min_support_views", self.min_support_views)),
-        }
-        self.type_reproj_radius_px = {
-            "thin_bright_structure": float(getattr(opt, "hotspot_thin_reproj_radius_px", self.reproj_radius_px)),
-            "highlight_deficit": float(getattr(opt, "hotspot_highlight_reproj_radius_px", self.reproj_radius_px)),
-            "general_high_error": float(getattr(opt, "hotspot_general_reproj_radius_px", self.reproj_radius_px)),
-        }
         self.min_view_angle_deg = float(opt.hotspot_min_view_angle_deg)
         self.error_multiplier = float(opt.hotspot_error_mean_multiplier)
         self.score_clip = float(opt.hotspot_score_clip)
@@ -161,33 +151,10 @@ class ErrorHotspotField:
 
     @staticmethod
     def _mask_type(mask_counts):
-        thin = 0
-        highlight = 0
-        high_error = 0
-        total = 0
-        for code_str, count in mask_counts.items():
-            code = int(code_str)
-            total += int(count)
-            if code & 4:
-                thin += int(count)
-            if code & 2:
-                highlight += int(count)
-            if code & 1:
-                high_error += int(count)
-        if total <= 0:
-            return "general_high_error"
-        if thin >= max(highlight, high_error) and thin / total >= 0.25:
-            return "thin_bright_structure"
-        if highlight >= high_error and highlight / total >= 0.25:
-            return "highlight_deficit"
-        return "general_high_error"
+        return "unified_hotspot"
 
     @staticmethod
     def _mask_type_weight(mask_type):
-        if mask_type == "thin_bright_structure":
-            return 1.5
-        if mask_type == "highlight_deficit":
-            return 1.2
         return 1.0
 
     def _center(self, key):
@@ -295,14 +262,10 @@ class ErrorHotspotField:
         self.sampled_pixels += sample_count
         sample_radius_cap = torch.full(
             (sample_count,),
-            float(self.type_reproj_radius_px.get("general_high_error", self.reproj_radius_px)),
+            float(self.reproj_radius_px),
             dtype=torch.float32,
             device=rgb_error.device,
         )
-        highlight_sample = highlight[sample_y, sample_x]
-        thin_sample = thin_bright[sample_y, sample_x]
-        sample_radius_cap[highlight_sample] = float(self.type_reproj_radius_px.get("highlight_deficit", self.reproj_radius_px))
-        sample_radius_cap[thin_sample] = float(self.type_reproj_radius_px.get("thin_bright_structure", self.reproj_radius_px))
 
         active = visibility_filter.detach()
         if active.sum() == 0:
@@ -330,7 +293,7 @@ class ErrorHotspotField:
         depth = depth[valid_depth]
         active_radii = active_radii[valid_depth].clamp_min(float(self.depth_min_radii))
         active_opacity = active_opacity[valid_depth]
-        radius_cap = max(float(self.depth_radius_cap_px), float(self.reproj_radius_px), max(self.type_reproj_radius_px.values()), 1.0)
+        radius_cap = max(float(self.depth_radius_cap_px), float(self.reproj_radius_px), 1.0)
         radius = active_radii.clamp(max=radius_cap)
 
         sample_index = torch.full((height, width), -1, dtype=torch.long, device=rgb_error.device)
@@ -338,7 +301,7 @@ class ErrorHotspotField:
         sample_index[sample_y, sample_x] = sample_ids
         depth_num = torch.zeros(sample_count, dtype=torch.float32, device=rgb_error.device)
         weight_sum = torch.zeros(sample_count, dtype=torch.float32, device=rgb_error.device)
-        cap = max(int(math.ceil(max(float(self.depth_radius_cap_px), float(self.reproj_radius_px), max(self.type_reproj_radius_px.values())))), 1)
+        cap = max(int(math.ceil(max(float(self.depth_radius_cap_px), float(self.reproj_radius_px)))), 1)
         for dy in range(-cap, cap + 1):
             sy = py + dy
             y_ok = (sy >= 0) & (sy < height)
@@ -397,8 +360,8 @@ class ErrorHotspotField:
             mean_rgb = stat["rgb_error_sum"] / max(stat["count"], 1)
             diverse, max_angle = _view_diverse(stat["view_dirs"].values(), self.min_view_angle_deg)
             mask_type = self._mask_type(stat["mask_counts"])
-            min_support_views = self.type_support_views.get(mask_type, self.min_support_views)
-            reproj_radius_px = self.type_reproj_radius_px.get(mask_type, self.reproj_radius_px)
+            min_support_views = self.min_support_views
+            reproj_radius_px = self.reproj_radius_px
             is_active = support_views >= min_support_views and diverse and mean_rgb >= global_error * self.error_multiplier
             if not is_active:
                 continue
@@ -418,7 +381,7 @@ class ErrorHotspotField:
                 "mask_type_weight": self._mask_type_weight(mask_type),
                 "reproj_radius_px": float(reproj_radius_px),
             })
-        active.sort(key=lambda item: (-item["score"] * item["mask_type_weight"], -item["support_views"], item["near_anchor_count"]))
+        active.sort(key=lambda item: (-item["score"], -item["support_views"], item["near_anchor_count"]))
         self.last_active = active
         self.last_summary = {
             "hotspot_voxels": len(self.stats),
@@ -462,7 +425,7 @@ class ErrorHotspotField:
             density_deficit_score = max(0.5, min(target_density / max(local_count, 1.0), 3.0))
             scored = dict(item)
             scored["density_deficit_score"] = float(density_deficit_score)
-            scored["candidate_score"] = float(item["score"]) * float(density_deficit_score) * float(item["mask_type_weight"])
+            scored["candidate_score"] = float(item["score"]) * float(density_deficit_score)
             low_density.append(scored)
         if not low_density:
             return None, None, {"active": len(active), "density_pass": 0, "proposed": 0, "mean_active_density": mean_active_density}
