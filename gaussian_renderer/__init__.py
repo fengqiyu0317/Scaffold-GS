@@ -19,6 +19,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     ## view frustum filtering for acceleration    
     if visible_mask is None:
         visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
+    visible_anchor_indices = torch.nonzero(visible_mask, as_tuple=False).squeeze(1)
     
     feat = pc._anchor_feat[visible_mask]
     anchor = pc.get_anchor[visible_mask]
@@ -64,6 +65,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     mask = (neural_opacity>0.0)
     mask = mask.view(-1)
 
+    if is_training:
+        neural_anchor_indices_all = visible_anchor_indices.unsqueeze(1).repeat(1, pc.n_offsets).reshape(-1)
+        neural_anchor_indices = neural_anchor_indices_all[mask]
+
     # select opacity 
     opacity = neural_opacity[mask]
 
@@ -106,11 +111,11 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     xyz = repeat_anchor + offsets
 
     if is_training:
-        return xyz, color, opacity, scaling, rot, neural_opacity, mask
+        return xyz, color, opacity, scaling, rot, neural_opacity, mask, neural_anchor_indices
     else:
         return xyz, color, opacity, scaling, rot
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, residue_error_map=None):
     """
     Render the scene. 
     
@@ -119,7 +124,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     is_training = pc.get_color_mlp.training
         
     if is_training:
-        xyz, color, opacity, scaling, rot, neural_opacity, mask = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, color, opacity, scaling, rot, neural_opacity, mask, neural_anchor_indices = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     else:
         xyz, color, opacity, scaling, rot = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     
@@ -155,7 +160,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii = rasterizer(
+    rendered_image, radii, gaussian_residue_num, gaussian_residue_den = rasterizer(
         means3D = xyz,
         means2D = screenspace_points,
         shs = None,
@@ -163,7 +168,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         opacities = opacity,
         scales = scaling,
         rotations = rot,
-        cov3D_precomp = None)
+        cov3D_precomp = None,
+        residue_error_map = residue_error_map)
     
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     if is_training:
@@ -174,6 +180,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "selection_mask": mask,
                 "neural_opacity": neural_opacity,
                 "scaling": scaling,
+                "neural_anchor_indices": neural_anchor_indices,
+                "gaussian_residue_num": gaussian_residue_num,
+                "gaussian_residue_den": gaussian_residue_den,
                 }
     else:
         return {"render": rendered_image,

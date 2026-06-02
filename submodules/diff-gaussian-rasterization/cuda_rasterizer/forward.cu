@@ -356,7 +356,10 @@ renderCUDA(
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
-	float* __restrict__ out_color)
+	float* __restrict__ out_color,
+	const float* __restrict__ residue_error_map,
+	float* __restrict__ residue_num,
+	float* __restrict__ residue_den)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -387,6 +390,7 @@ renderCUDA(
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
+	bool track_residue = residue_error_map != nullptr && residue_num != nullptr && residue_den != nullptr;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -438,8 +442,16 @@ renderCUDA(
 			}
 
 			// Eq. (3) from 3D Gaussian splatting paper.
+			float contribution = alpha * T;
 			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * contribution;
+
+			if (track_residue)
+			{
+				int gaussian_id = collected_id[j];
+				atomicAdd(residue_num + gaussian_id, contribution * residue_error_map[pix_id]);
+				atomicAdd(residue_den + gaussian_id, contribution);
+			}
 
 			T = test_T;
 
@@ -472,7 +484,10 @@ void FORWARD::render(
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
-	float* out_color)
+	float* out_color,
+	const float* residue_error_map,
+	float* residue_num,
+	float* residue_den)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -484,7 +499,10 @@ void FORWARD::render(
 		final_T,
 		n_contrib,
 		bg_color,
-		out_color);
+		out_color,
+		residue_error_map,
+		residue_num,
+		residue_den);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

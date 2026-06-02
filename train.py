@@ -33,7 +33,7 @@ import torchvision.transforms.functional as tf
 # from lpipsPyTorch import lpips
 import lpips
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ssim, ssim_error_map
 from gaussian_renderer import prefilter_voxel, render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -54,6 +54,14 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
     print("not found tf board")
+
+def build_residue_error_map(image, gt_image, opt):
+    image = image.detach().clamp(0.0, 1.0)
+    gt_image = gt_image.detach().clamp(0.0, 1.0)
+    l1_map = torch.abs(image - gt_image).mean(dim=0)
+    ssim_map = ssim_error_map(image, gt_image).detach()
+    lambda_dssim = float(getattr(opt, "lambda_dssim", 0.2))
+    return ((1.0 - lambda_dssim) * l1_map + lambda_dssim * ssim_map).contiguous()
 
 def saveRuntimeCode(dst: str) -> None:
     additionalIgnorePatterns = ['.git', '.gitignore']
@@ -138,6 +146,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
         gt_image = viewpoint_cam.original_image.cuda()
+        residue_pkg = None
+        if opt.use_residue_tracking and iteration < opt.update_until and iteration > opt.start_stat:
+            residue_error_map = build_residue_error_map(image, gt_image, opt)
+            with torch.no_grad():
+                residue_pkg = render(
+                    viewpoint_cam, gaussians, pipe, background,
+                    visible_mask=voxel_visible_mask, residue_error_map=residue_error_map
+                )
+
         Ll1 = l1_loss(image, gt_image)
 
         ssim_loss = (1.0 - ssim(image, gt_image))
@@ -159,6 +176,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 progress_bar.close()
 
             # Log and save
+            if (opt.use_residue_tracking and hasattr(gaussians, "anchor_residue_seen")
+                    and iteration % opt.residue_log_interval == 0 and gaussians.anchor_residue_seen.numel() > 0):
+                residue_seen = gaussians.anchor_residue_seen.squeeze(1) > 0
+                if residue_seen.sum() > 0:
+                    residue_values = gaussians.get_anchor_residue[residue_seen]
+                    if tb_writer:
+                        tb_writer.add_scalar(f'{dataset_name}/residue/mean', residue_values.mean().item(), iteration)
+                        tb_writer.add_scalar(f'{dataset_name}/residue/max', residue_values.max().item(), iteration)
+                        tb_writer.add_scalar(f'{dataset_name}/residue/observed_anchors', residue_seen.sum().item(), iteration)
+                        tb_writer.add_scalar(f'{dataset_name}/residue/mean_den', gaussians.anchor_residue_den_ema[residue_seen].mean().item(), iteration)
+
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -167,7 +195,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             # densification
             if iteration < opt.update_until and iteration > opt.start_stat:
                 # add statis
-                gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask)
+                gaussians.training_statis(
+                    viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask,
+                    gaussian_residue_num=None if residue_pkg is None else residue_pkg.get("gaussian_residue_num", None),
+                    gaussian_residue_den=None if residue_pkg is None else residue_pkg.get("gaussian_residue_den", None),
+                    neural_anchor_indices=None if residue_pkg is None else residue_pkg.get("neural_anchor_indices", None),
+                )
                 
                 # densification
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
@@ -176,6 +209,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
                 del gaussians.offset_denom
+                if getattr(gaussians, "use_residue_tracking", False):
+                    del gaussians.anchor_residue_num_ema
+                    del gaussians.anchor_residue_den_ema
+                    del gaussians.anchor_residue_seen
                 torch.cuda.empty_cache()
                     
             # Optimizer step

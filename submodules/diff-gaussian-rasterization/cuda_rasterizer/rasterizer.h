@@ -49,6 +49,9 @@ namespace CudaRasterizer
 			const float tan_fovx, float tan_fovy,
 			const bool prefiltered,
 			float* out_color,
+			const float* residue_error_map = nullptr,
+			float* residue_num = nullptr,
+			float* residue_den = nullptr,
 			int* radii = nullptr,
 			bool debug = false);
 

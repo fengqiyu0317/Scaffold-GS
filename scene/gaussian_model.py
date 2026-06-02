@@ -79,6 +79,13 @@ class GaussianModel:
         self._anchor_feat = torch.empty(0)
         
         self.opacity_accum = torch.empty(0)
+        self.use_residue_tracking = False
+        self.residue_ema = 0.9
+        self.residue_min_den = 1.0
+        self.residue_div_eps = 1e-8
+        self.anchor_residue_num_ema = torch.empty(0)
+        self.anchor_residue_den_ema = torch.empty(0)
+        self.anchor_residue_seen = torch.empty(0)
 
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
@@ -211,6 +218,12 @@ class GaussianModel:
     @property
     def get_anchor(self):
         return self._anchor
+
+    @property
+    def get_anchor_residue(self):
+        if self.anchor_residue_num_ema.numel() == 0:
+            return torch.empty(0, device=self.get_anchor.device)
+        return self.anchor_residue_num_ema / self.anchor_residue_den_ema.clamp_min(self.residue_div_eps)
     
     @property
     def set_anchor(self, new_anchor):
@@ -274,12 +287,24 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        self.use_residue_tracking = getattr(training_args, "use_residue_tracking", False)
+        self.residue_ema = getattr(training_args, "residue_ema", 0.9)
+        self.residue_min_den = getattr(training_args, "residue_min_den", 1.0)
+        self.residue_div_eps = getattr(training_args, "residue_div_eps", 1e-8)
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        if self.use_residue_tracking:
+            self.anchor_residue_num_ema = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+            self.anchor_residue_den_ema = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+            self.anchor_residue_seen = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        else:
+            self.anchor_residue_num_ema = torch.empty(0, device="cuda")
+            self.anchor_residue_den_ema = torch.empty(0, device="cuda")
+            self.anchor_residue_seen = torch.empty(0, device="cuda")
 
         
         
@@ -506,7 +531,8 @@ class GaussianModel:
 
 
     # statis grad information to guide liftting. 
-    def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask):
+    def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask,
+                        gaussian_residue_num=None, gaussian_residue_den=None, neural_anchor_indices=None):
         # update opacity stats
         temp_opacity = opacity.clone().view(-1).detach()
         temp_opacity[temp_opacity<0] = 0
@@ -527,6 +553,30 @@ class GaussianModel:
         grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.offset_gradient_accum[combined_mask] += grad_norm
         self.offset_denom[combined_mask] += 1
+
+        if (self.use_residue_tracking and gaussian_residue_num is not None
+                and gaussian_residue_den is not None and neural_anchor_indices is not None):
+            gaussian_residue_num = gaussian_residue_num.detach().view(-1, 1)
+            gaussian_residue_den = gaussian_residue_den.detach().view(-1, 1)
+            observed_gaussian = gaussian_residue_den.squeeze(1) > 0
+            if observed_gaussian.sum() > 0:
+                anchor_indices = neural_anchor_indices[observed_gaussian].detach().long().view(-1, 1)
+                batch_num = torch.zeros_like(self.anchor_residue_num_ema)
+                batch_den = torch.zeros_like(self.anchor_residue_den_ema)
+                batch_num.scatter_add_(0, anchor_indices, gaussian_residue_num[observed_gaussian])
+                batch_den.scatter_add_(0, anchor_indices, gaussian_residue_den[observed_gaussian])
+                reliable_anchor = batch_den.squeeze(1) > self.residue_min_den
+                if reliable_anchor.sum() > 0:
+                    m = float(self.residue_ema)
+                    self.anchor_residue_num_ema[reliable_anchor] = (
+                        m * self.anchor_residue_num_ema[reliable_anchor]
+                        + (1.0 - m) * batch_num[reliable_anchor]
+                    )
+                    self.anchor_residue_den_ema[reliable_anchor] = (
+                        m * self.anchor_residue_den_ema[reliable_anchor]
+                        + (1.0 - m) * batch_den[reliable_anchor]
+                    )
+                    self.anchor_residue_seen[reliable_anchor] += 1
 
         
 
@@ -666,6 +716,12 @@ class GaussianModel:
                 del self.opacity_accum
                 self.opacity_accum = temp_opacity_accum
 
+                if self.use_residue_tracking:
+                    zeros = torch.zeros([new_opacities.shape[0], 1], device="cuda").float()
+                    self.anchor_residue_num_ema = torch.cat([self.anchor_residue_num_ema, zeros.clone()], dim=0)
+                    self.anchor_residue_den_ema = torch.cat([self.anchor_residue_den_ema, zeros.clone()], dim=0)
+                    self.anchor_residue_seen = torch.cat([self.anchor_residue_seen, zeros], dim=0)
+
                 torch.cuda.empty_cache()
                 
                 optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -720,6 +776,10 @@ class GaussianModel:
         if anchors_mask.sum()>0:
             self.opacity_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
             self.anchor_demon[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
+            if self.use_residue_tracking:
+                self.anchor_residue_num_ema[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
+                self.anchor_residue_den_ema[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
+                self.anchor_residue_seen[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
         
         temp_opacity_accum = self.opacity_accum[~prune_mask]
         del self.opacity_accum
@@ -728,6 +788,17 @@ class GaussianModel:
         temp_anchor_demon = self.anchor_demon[~prune_mask]
         del self.anchor_demon
         self.anchor_demon = temp_anchor_demon
+
+        if self.use_residue_tracking:
+            temp_residue_num = self.anchor_residue_num_ema[~prune_mask]
+            temp_residue_den = self.anchor_residue_den_ema[~prune_mask]
+            temp_residue_seen = self.anchor_residue_seen[~prune_mask]
+            del self.anchor_residue_num_ema
+            del self.anchor_residue_den_ema
+            del self.anchor_residue_seen
+            self.anchor_residue_num_ema = temp_residue_num
+            self.anchor_residue_den_ema = temp_residue_den
+            self.anchor_residue_seen = temp_residue_seen
 
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)

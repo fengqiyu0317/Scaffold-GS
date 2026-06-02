@@ -40,7 +40,25 @@ def ssim(img1, img2, window_size=11, size_average=True):
 
     return _ssim(img1, img2, window, window_size, channel, size_average)
 
-def _ssim(img1, img2, window, window_size, channel, size_average=True):
+def ssim_error_map(img1, img2, window_size=11):
+    squeeze_batch = False
+    if img1.dim() == 3:
+        img1 = img1.unsqueeze(0)
+        img2 = img2.unsqueeze(0)
+        squeeze_batch = True
+
+    channel = img1.size(-3)
+    window = create_window(window_size, channel)
+    if img1.is_cuda:
+        window = window.cuda(img1.get_device())
+    window = window.type_as(img1)
+
+    error_map = (1.0 - _ssim_map(img1, img2, window, window_size, channel).mean(dim=1)).clamp_min(0.0)
+    if squeeze_batch:
+        error_map = error_map.squeeze(0)
+    return error_map
+
+def _ssim_map(img1, img2, window, window_size, channel):
     mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
     mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)
 
@@ -55,7 +73,10 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     C1 = 0.01 ** 2
     C2 = 0.03 ** 2
 
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+def _ssim(img1, img2, window, window_size, channel, size_average=True):
+    ssim_map = _ssim_map(img1, img2, window, window_size, channel)
 
     if size_average:
         return ssim_map.mean()

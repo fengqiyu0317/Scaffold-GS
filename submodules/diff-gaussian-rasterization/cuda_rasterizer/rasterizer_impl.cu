@@ -216,6 +216,9 @@ int CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	float* out_color,
+	const float* residue_error_map,
+	float* residue_num,
+	float* residue_den,
 	int* radii,
 	bool debug)
 {
@@ -330,7 +333,10 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
-		out_color
+		out_color,
+		residue_error_map,
+		residue_num,
+		residue_den
 		), debug)
 
 	return num_rendered;

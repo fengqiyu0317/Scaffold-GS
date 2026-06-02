@@ -152,6 +152,14 @@ class OptimizationParams(ParamGroup):
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
 
+        # Optional per-anchor residue tracking. Disabled by default to keep
+        # baseline densification and pruning unchanged.
+        self.use_residue_tracking = False
+        self.residue_ema = 0.9
+        self.residue_min_den = 1.0
+        self.residue_div_eps = 1e-8
+        self.residue_log_interval = 100
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
