@@ -436,8 +436,15 @@ class GaussianModel:
             new_parent[orphan] = -1
 
         self.anchor_parent = new_parent.long()
-        self.anchor_depth = self.anchor_depth[valid_points_mask].clone().int()
-        self.anchor_depth[self.anchor_parent < 0] = 0
+        old_depth = self.anchor_depth[valid_points_mask].clone().int()
+        self.anchor_depth = torch.zeros_like(old_depth, dtype=torch.int32)
+        max_old_depth = int(old_depth.max().item()) if old_depth.numel() > 0 else 0
+        for depth in range(1, max_old_depth + 1):
+            depth_mask = torch.logical_and(old_depth == depth, self.anchor_parent >= 0)
+            node_ids = torch.nonzero(depth_mask, as_tuple=False).squeeze(1)
+            if node_ids.numel() == 0:
+                continue
+            self.anchor_depth[node_ids] = self.anchor_depth[self.anchor_parent[node_ids]].int() + 1
         self.anchor_children_count = torch.zeros_like(self.anchor_depth, dtype=torch.int32)
         valid_child = self.anchor_parent >= 0
         if valid_child.sum() > 0:
