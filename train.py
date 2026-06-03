@@ -147,7 +147,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         gt_image = viewpoint_cam.original_image.cuda()
         residue_pkg = None
-        if opt.use_residue_tracking and iteration < opt.update_until and iteration > opt.start_stat:
+        if (opt.use_residue_tracking or opt.use_adaptive_k) and iteration < opt.update_until and iteration > opt.start_stat:
             residue_error_map = build_residue_error_map(image, gt_image, opt)
             with torch.no_grad():
                 residue_pkg = render(
@@ -176,7 +176,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 progress_bar.close()
 
             # Log and save
-            if (opt.use_residue_tracking and hasattr(gaussians, "anchor_residue_seen")
+            if ((opt.use_residue_tracking or opt.use_adaptive_k) and hasattr(gaussians, "anchor_residue_seen")
                     and iteration % opt.residue_log_interval == 0 and gaussians.anchor_residue_seen.numel() > 0):
                 residue_seen = gaussians.anchor_residue_seen.squeeze(1) > 0
                 if residue_seen.sum() > 0:
@@ -186,6 +186,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         tb_writer.add_scalar(f'{dataset_name}/residue/max', residue_values.max().item(), iteration)
                         tb_writer.add_scalar(f'{dataset_name}/residue/observed_anchors', residue_seen.sum().item(), iteration)
                         tb_writer.add_scalar(f'{dataset_name}/residue/mean_den', gaussians.anchor_residue_den_ema[residue_seen].mean().item(), iteration)
+
+            if (opt.use_adaptive_k and hasattr(gaussians, "anchor_active_offsets")
+                    and iteration % opt.residue_log_interval == 0 and gaussians.anchor_active_offsets.numel() > 0):
+                active_k = gaussians.anchor_active_offsets.float()
+                if tb_writer:
+                    tb_writer.add_scalar(f'{dataset_name}/adaptive_k/mean', active_k.mean().item(), iteration)
+                    tb_writer.add_scalar(f'{dataset_name}/adaptive_k/min', active_k.min().item(), iteration)
+                    tb_writer.add_scalar(f'{dataset_name}/adaptive_k/max', active_k.max().item(), iteration)
+                    if hasattr(gaussians, "anchor_visibility_ema") and gaussians.anchor_visibility_ema.numel() > 0:
+                        tb_writer.add_scalar(f'{dataset_name}/adaptive_k/visibility_mean', gaussians.anchor_visibility_ema.mean().item(), iteration)
 
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
             if (iteration in saving_iterations):
@@ -202,6 +212,14 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     neural_anchor_indices=None if residue_pkg is None else residue_pkg.get("neural_anchor_indices", None),
                 )
                 
+                if (opt.use_adaptive_k and iteration > opt.update_from
+                        and iteration % opt.adaptive_k_update_interval == 0):
+                    adaptive_stats = gaussians.adjust_adaptive_k()
+                    if tb_writer and adaptive_stats:
+                        tb_writer.add_scalar(f'{dataset_name}/adaptive_k/grow', adaptive_stats.get("grow", 0), iteration)
+                        tb_writer.add_scalar(f'{dataset_name}/adaptive_k/shrink', adaptive_stats.get("shrink", 0), iteration)
+                        tb_writer.add_scalar(f'{dataset_name}/adaptive_k/valid', adaptive_stats.get("valid", 0), iteration)
+
                 # densification
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
                     gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity)
@@ -213,6 +231,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     del gaussians.anchor_residue_num_ema
                     del gaussians.anchor_residue_den_ema
                     del gaussians.anchor_residue_seen
+                if getattr(gaussians, "use_adaptive_k", False):
+                    del gaussians.anchor_visibility_ema
+                    del gaussians.adaptive_high_count
+                    del gaussians.adaptive_low_count
                 torch.cuda.empty_cache()
                     
             # Optimizer step

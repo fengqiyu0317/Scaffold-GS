@@ -87,6 +87,23 @@ class GaussianModel:
         self.anchor_residue_den_ema = torch.empty(0)
         self.anchor_residue_seen = torch.empty(0)
 
+        self.use_adaptive_k = False
+        self.adaptive_k_min = 1
+        self.adaptive_k_init = n_offsets
+        self.adaptive_visibility_ema = 0.9
+        self.adaptive_visibility_threshold = 0.3
+        self.adaptive_visibility_norm_percentile = 0.75
+        self.adaptive_residue_low_percentile = 0.30
+        self.adaptive_residue_high_percentile = 0.80
+        self.adaptive_grow_threshold = 0.8
+        self.adaptive_shrink_threshold = 0.2
+        self.adaptive_grow_hysteresis = 3
+        self.adaptive_shrink_hysteresis = 5
+        self.anchor_active_offsets = torch.empty(0, dtype=torch.long)
+        self.anchor_visibility_ema = torch.empty(0)
+        self.adaptive_high_count = torch.empty(0, dtype=torch.long)
+        self.adaptive_low_count = torch.empty(0, dtype=torch.long)
+
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -224,6 +241,18 @@ class GaussianModel:
         if self.anchor_residue_num_ema.numel() == 0:
             return torch.empty(0, device=self.get_anchor.device)
         return self.anchor_residue_num_ema / self.anchor_residue_den_ema.clamp_min(self.residue_div_eps)
+
+    def get_active_offset_mask(self, anchor_mask=None):
+        device = self.get_anchor.device
+        if (not self.use_adaptive_k) or self.anchor_active_offsets.numel() == 0:
+            count = int(anchor_mask.sum().item()) if anchor_mask is not None else self.get_anchor.shape[0]
+            return torch.ones((count, self.n_offsets), dtype=torch.bool, device=device)
+
+        active_offsets = self.anchor_active_offsets
+        if anchor_mask is not None:
+            active_offsets = active_offsets[anchor_mask]
+        offset_ids = torch.arange(self.n_offsets, device=device).view(1, -1)
+        return offset_ids < active_offsets.view(-1, 1)
     
     @property
     def set_anchor(self, new_anchor):
@@ -287,10 +316,22 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
-        self.use_residue_tracking = getattr(training_args, "use_residue_tracking", False)
+        self.use_adaptive_k = getattr(training_args, "use_adaptive_k", False)
+        self.use_residue_tracking = getattr(training_args, "use_residue_tracking", False) or self.use_adaptive_k
         self.residue_ema = getattr(training_args, "residue_ema", 0.9)
         self.residue_min_den = getattr(training_args, "residue_min_den", 1.0)
         self.residue_div_eps = getattr(training_args, "residue_div_eps", 1e-8)
+        self.adaptive_k_min = max(1, min(int(getattr(training_args, "adaptive_k_min", 1)), self.n_offsets))
+        self.adaptive_k_init = max(self.adaptive_k_min, min(int(getattr(training_args, "adaptive_k_init", self.n_offsets)), self.n_offsets))
+        self.adaptive_visibility_ema = float(getattr(training_args, "adaptive_visibility_ema", 0.9))
+        self.adaptive_visibility_threshold = float(getattr(training_args, "adaptive_visibility_threshold", 0.3))
+        self.adaptive_visibility_norm_percentile = float(getattr(training_args, "adaptive_visibility_norm_percentile", 0.75))
+        self.adaptive_residue_low_percentile = float(getattr(training_args, "adaptive_residue_low_percentile", 0.30))
+        self.adaptive_residue_high_percentile = float(getattr(training_args, "adaptive_residue_high_percentile", 0.80))
+        self.adaptive_grow_threshold = float(getattr(training_args, "adaptive_grow_threshold", 0.8))
+        self.adaptive_shrink_threshold = float(getattr(training_args, "adaptive_shrink_threshold", 0.2))
+        self.adaptive_grow_hysteresis = max(1, int(getattr(training_args, "adaptive_grow_hysteresis", 3)))
+        self.adaptive_shrink_hysteresis = max(1, int(getattr(training_args, "adaptive_shrink_hysteresis", 5)))
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
@@ -305,6 +346,18 @@ class GaussianModel:
             self.anchor_residue_num_ema = torch.empty(0, device="cuda")
             self.anchor_residue_den_ema = torch.empty(0, device="cuda")
             self.anchor_residue_seen = torch.empty(0, device="cuda")
+
+        if self.use_adaptive_k:
+            self.anchor_active_offsets = torch.full(
+                (self.get_anchor.shape[0], 1), self.adaptive_k_init, dtype=torch.long, device="cuda")
+            self.anchor_visibility_ema = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+            self.adaptive_high_count = torch.zeros((self.get_anchor.shape[0], 1), dtype=torch.long, device="cuda")
+            self.adaptive_low_count = torch.zeros((self.get_anchor.shape[0], 1), dtype=torch.long, device="cuda")
+        else:
+            self.anchor_active_offsets = torch.empty(0, dtype=torch.long, device="cuda")
+            self.anchor_visibility_ema = torch.empty(0, device="cuda")
+            self.adaptive_high_count = torch.empty(0, dtype=torch.long, device="cuda")
+            self.adaptive_low_count = torch.empty(0, dtype=torch.long, device="cuda")
 
         
         
@@ -565,6 +618,17 @@ class GaussianModel:
                 batch_den = torch.zeros_like(self.anchor_residue_den_ema)
                 batch_num.scatter_add_(0, anchor_indices, gaussian_residue_num[observed_gaussian])
                 batch_den.scatter_add_(0, anchor_indices, gaussian_residue_den[observed_gaussian])
+                if self.use_adaptive_k and self.anchor_visibility_ema.numel() > 0:
+                    positive_den = batch_den[batch_den.squeeze(1) > 0]
+                    if positive_den.numel() > 0:
+                        q = min(max(self.adaptive_visibility_norm_percentile, 0.0), 1.0)
+                        norm = torch.quantile(positive_den.view(-1), q).clamp_min(self.residue_div_eps)
+                        batch_visibility = torch.clamp(batch_den / norm, 0.0, 1.0)
+                    else:
+                        batch_visibility = torch.zeros_like(batch_den)
+                    mv = float(self.adaptive_visibility_ema)
+                    self.anchor_visibility_ema = mv * self.anchor_visibility_ema + (1.0 - mv) * batch_visibility
+
                 reliable_anchor = batch_den.squeeze(1) > self.residue_min_den
                 if reliable_anchor.sum() > 0:
                     m = float(self.residue_ema)
@@ -579,6 +643,64 @@ class GaussianModel:
                     self.anchor_residue_seen[reliable_anchor] += 1
 
         
+
+    def adjust_adaptive_k(self):
+        if (not self.use_adaptive_k) or self.anchor_active_offsets.numel() == 0:
+            return {}
+        if self.anchor_residue_num_ema.numel() == 0 or self.anchor_visibility_ema.numel() == 0:
+            return {}
+
+        residue = self.get_anchor_residue.squeeze(1)
+        visibility = self.anchor_visibility_ema.squeeze(1)
+        seen = self.anchor_residue_seen.squeeze(1) > 0
+        valid = torch.logical_and(seen, visibility > self.adaptive_visibility_threshold)
+        if valid.sum() < 2:
+            return {"valid": int(valid.sum().item()), "grow": 0, "shrink": 0}
+
+        valid_residue = residue[valid]
+        q_low = min(max(self.adaptive_residue_low_percentile, 0.0), 1.0)
+        q_high = min(max(self.adaptive_residue_high_percentile, 0.0), 1.0)
+        r_low = torch.quantile(valid_residue, q_low)
+        r_high = torch.quantile(valid_residue, q_high)
+        residue_norm = torch.clamp((residue - r_low) / (r_high - r_low + self.residue_div_eps), 0.0, 1.0)
+
+        high = torch.logical_and(valid, residue_norm > self.adaptive_grow_threshold)
+        low = torch.logical_and(valid, residue_norm < self.adaptive_shrink_threshold)
+
+        self.adaptive_high_count[high, 0] += 1
+        self.adaptive_high_count[~high, 0] = 0
+        self.adaptive_low_count[low, 0] += 1
+        self.adaptive_low_count[~low, 0] = 0
+
+        active = self.anchor_active_offsets.squeeze(1)
+        grow = torch.logical_and(self.adaptive_high_count.squeeze(1) >= self.adaptive_grow_hysteresis, active < self.n_offsets)
+        shrink = torch.logical_and(self.adaptive_low_count.squeeze(1) >= self.adaptive_shrink_hysteresis, active > self.adaptive_k_min)
+
+        grow_count = int(grow.sum().item())
+        shrink_count = int(shrink.sum().item())
+        if grow_count > 0:
+            grow_idx = torch.nonzero(grow, as_tuple=False).squeeze(1)
+            new_slot = self.anchor_active_offsets[grow_idx, 0]
+            src_slot = torch.clamp(new_slot - 1, min=0)
+            base_offset = self._offset.data[grow_idx, src_slot].clone()
+            noise_scale = max(float(self.voxel_size), 1e-6) * 0.01
+            self._offset.data[grow_idx, new_slot] = base_offset + torch.randn_like(base_offset) * noise_scale
+            self.anchor_active_offsets[grow_idx, 0] += 1
+            self.adaptive_high_count[grow_idx, 0] = 0
+            self.adaptive_low_count[grow_idx, 0] = 0
+
+        if shrink_count > 0:
+            shrink_idx = torch.nonzero(shrink, as_tuple=False).squeeze(1)
+            self.anchor_active_offsets[shrink_idx, 0] -= 1
+            self.adaptive_high_count[shrink_idx, 0] = 0
+            self.adaptive_low_count[shrink_idx, 0] = 0
+
+        return {
+            "valid": int(valid.sum().item()),
+            "grow": grow_count,
+            "shrink": shrink_count,
+            "mean_k": float(self.anchor_active_offsets.float().mean().item()),
+        }
 
         
     def _prune_anchor_optimizer(self, mask):
@@ -722,6 +844,15 @@ class GaussianModel:
                     self.anchor_residue_den_ema = torch.cat([self.anchor_residue_den_ema, zeros.clone()], dim=0)
                     self.anchor_residue_seen = torch.cat([self.anchor_residue_seen, zeros], dim=0)
 
+                if self.use_adaptive_k:
+                    new_active = torch.full([new_opacities.shape[0], 1], self.adaptive_k_init, dtype=torch.long, device="cuda")
+                    self.anchor_active_offsets = torch.cat([self.anchor_active_offsets, new_active], dim=0)
+                    zeros = torch.zeros([new_opacities.shape[0], 1], device="cuda").float()
+                    self.anchor_visibility_ema = torch.cat([self.anchor_visibility_ema, zeros.clone()], dim=0)
+                    zero_count = torch.zeros([new_opacities.shape[0], 1], dtype=torch.long, device="cuda")
+                    self.adaptive_high_count = torch.cat([self.adaptive_high_count, zero_count.clone()], dim=0)
+                    self.adaptive_low_count = torch.cat([self.adaptive_low_count, zero_count], dim=0)
+
                 torch.cuda.empty_cache()
                 
                 optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -780,6 +911,10 @@ class GaussianModel:
                 self.anchor_residue_num_ema[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
                 self.anchor_residue_den_ema[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
                 self.anchor_residue_seen[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
+            if self.use_adaptive_k:
+                self.anchor_visibility_ema[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device="cuda").float()
+                self.adaptive_high_count[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], dtype=torch.long, device="cuda")
+                self.adaptive_low_count[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], dtype=torch.long, device="cuda")
         
         temp_opacity_accum = self.opacity_accum[~prune_mask]
         del self.opacity_accum
@@ -799,6 +934,20 @@ class GaussianModel:
             self.anchor_residue_num_ema = temp_residue_num
             self.anchor_residue_den_ema = temp_residue_den
             self.anchor_residue_seen = temp_residue_seen
+
+        if self.use_adaptive_k:
+            temp_active_offsets = self.anchor_active_offsets[~prune_mask]
+            temp_visibility = self.anchor_visibility_ema[~prune_mask]
+            temp_high_count = self.adaptive_high_count[~prune_mask]
+            temp_low_count = self.adaptive_low_count[~prune_mask]
+            del self.anchor_active_offsets
+            del self.anchor_visibility_ema
+            del self.adaptive_high_count
+            del self.adaptive_low_count
+            self.anchor_active_offsets = temp_active_offsets
+            self.anchor_visibility_ema = temp_visibility
+            self.adaptive_high_count = temp_high_count
+            self.adaptive_low_count = temp_low_count
 
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)

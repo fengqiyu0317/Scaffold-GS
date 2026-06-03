@@ -160,6 +160,22 @@ class OptimizationParams(ParamGroup):
         self.residue_div_eps = 1e-8
         self.residue_log_interval = 100
 
+        # Optional adaptive per-anchor active offset count. The fixed model
+        # tensor width remains n_offsets; this only masks inactive slots.
+        self.use_adaptive_k = False
+        self.adaptive_k_min = 4
+        self.adaptive_k_init = 8
+        self.adaptive_visibility_ema = 0.9
+        self.adaptive_visibility_threshold = 0.3
+        self.adaptive_visibility_norm_percentile = 0.75
+        self.adaptive_residue_low_percentile = 0.30
+        self.adaptive_residue_high_percentile = 0.80
+        self.adaptive_grow_threshold = 0.8
+        self.adaptive_shrink_threshold = 0.2
+        self.adaptive_grow_hysteresis = 3
+        self.adaptive_shrink_hysteresis = 5
+        self.adaptive_k_update_interval = 100
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
