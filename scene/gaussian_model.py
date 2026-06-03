@@ -683,7 +683,7 @@ class GaussianModel:
             new_slot = self.anchor_active_offsets[grow_idx, 0]
             src_slot = torch.clamp(new_slot - 1, min=0)
             base_offset = self._offset.data[grow_idx, src_slot].clone()
-            noise_scale = max(float(self.voxel_size), 1e-6) * 0.01
+            noise_scale = 0.01
             self._offset.data[grow_idx, new_slot] = base_offset + torch.randn_like(base_offset) * noise_scale
             self.anchor_active_offsets[grow_idx, 0] += 1
             self.adaptive_high_count[grow_idx, 0] = 0
