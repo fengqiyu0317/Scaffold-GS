@@ -37,6 +37,7 @@ from utils.loss_utils import l1_loss, ssim, ssim_error_map
 from gaussian_renderer import prefilter_voxel, render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.error_field import ErrorField, save_error_field_checkpoint, save_error_points_ply, train_error_field_steps
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
@@ -98,6 +99,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
+    error_field = None
+    error_field_optim = None
+    error_field_trained = False
+    error_field_bbox_min = None
+    error_field_bbox_max = None
+    if opt.use_error_field:
+        error_field = ErrorField(
+            num_freqs=opt.error_field_num_freqs,
+            hidden_dim=opt.error_field_hidden_dim,
+        ).cuda()
+        error_field_optim = torch.optim.Adam(error_field.parameters(), lr=opt.error_field_lr)
+
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
@@ -147,7 +160,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         gt_image = viewpoint_cam.original_image.cuda()
         residue_pkg = None
-        if (opt.use_residue_tracking or opt.use_adaptive_k) and iteration < opt.update_until and iteration > opt.start_stat:
+        if (opt.use_residue_tracking or opt.use_adaptive_k or opt.use_error_field) and iteration < opt.update_until and iteration > opt.start_stat:
             residue_error_map = build_residue_error_map(image, gt_image, opt)
             with torch.no_grad():
                 residue_pkg = render(
@@ -176,7 +189,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 progress_bar.close()
 
             # Log and save
-            if ((opt.use_residue_tracking or opt.use_adaptive_k) and hasattr(gaussians, "anchor_residue_seen")
+            if ((opt.use_residue_tracking or opt.use_adaptive_k or opt.use_error_field) and hasattr(gaussians, "anchor_residue_seen")
                     and iteration % opt.residue_log_interval == 0 and gaussians.anchor_residue_seen.numel() > 0):
                 residue_seen = gaussians.anchor_residue_seen.squeeze(1) > 0
                 if residue_seen.sum() > 0:
@@ -204,6 +217,20 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                if opt.use_error_field and error_field_trained:
+                    error_field_dir = os.path.join(scene.model_path, "error_field")
+                    save_error_field_checkpoint(
+                        error_field, error_field_optim, error_field_bbox_min, error_field_bbox_max,
+                        os.path.join(error_field_dir, "error_field_latest.pth"), iteration, opt,
+                    )
+                    exported_points = save_error_points_ply(
+                        error_field, error_field_bbox_min, error_field_bbox_max,
+                        os.path.join(error_field_dir, "high_error_points_{}.ply".format(iteration)),
+                        resolution=opt.error_field_query_resolution,
+                        threshold=opt.error_field_score_threshold,
+                    )
+                    if tb_writer:
+                        tb_writer.add_scalar(f'{dataset_name}/error_field/exported_points', exported_points, iteration)
             
             # densification
             if iteration < opt.update_until and iteration > opt.start_stat:
@@ -214,6 +241,39 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     gaussian_residue_den=None if residue_pkg is None else residue_pkg.get("gaussian_residue_den", None),
                     neural_anchor_indices=None if residue_pkg is None else residue_pkg.get("neural_anchor_indices", None),
                 )
+
+                if (opt.use_error_field and error_field is not None
+                        and iteration >= opt.error_field_start
+                        and iteration % opt.error_field_interval == 0
+                        and hasattr(gaussians, "anchor_residue_seen")
+                        and gaussians.anchor_residue_seen.numel() > 0):
+                    with torch.enable_grad():
+                        error_stats = train_error_field_steps(
+                            error_field=error_field,
+                            error_optim=error_field_optim,
+                            anchor_pos=gaussians.get_anchor,
+                            residue_num_ema=gaussians.anchor_residue_num_ema,
+                            residue_den_ema=gaussians.anchor_residue_den_ema,
+                            residue_seen=gaussians.anchor_residue_seen,
+                            steps=opt.error_field_steps,
+                            batch_size=opt.error_field_batch_size,
+                            jitter_std=opt.error_field_jitter_std,
+                            lambda_sparse=opt.error_field_sparse_weight,
+                            lambda_smooth=opt.error_field_smooth_weight,
+                            eps=opt.residue_div_eps,
+                        )
+                    if error_stats and not error_stats.get("skipped", False):
+                        error_field_trained = True
+                        error_field_bbox_min = error_stats["bbox_min"]
+                        error_field_bbox_max = error_stats["bbox_max"]
+                        if tb_writer:
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/loss', error_stats["loss"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/loss_data', error_stats["loss_data"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/loss_sparse', error_stats["loss_sparse"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/loss_smooth', error_stats["loss_smooth"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/valid_anchors', error_stats["valid_anchors"], iteration)
+                    elif tb_writer and error_stats:
+                        tb_writer.add_scalar(f'{dataset_name}/error_field/valid_anchors', error_stats.get("valid_anchors", 0), iteration)
                 
                 if (opt.use_adaptive_k and iteration > opt.update_from
                         and iteration % opt.adaptive_k_update_interval == 0):
@@ -250,6 +310,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if (iteration in checkpoint_iterations):
                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                if opt.use_error_field and error_field_trained:
+                    save_error_field_checkpoint(
+                        error_field, error_field_optim, error_field_bbox_min, error_field_bbox_max,
+                        os.path.join(scene.model_path, "error_field", "error_field_latest.pth"), iteration, opt,
+                    )
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

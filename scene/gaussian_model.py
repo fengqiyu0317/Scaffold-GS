@@ -88,6 +88,7 @@ class GaussianModel:
         self.anchor_residue_seen = torch.empty(0)
 
         self.use_adaptive_k = False
+        self.use_error_field = False
         self.adaptive_k_min = 1
         self.adaptive_k_init = n_offsets
         self.adaptive_min_seen_grow = 1
@@ -177,34 +178,78 @@ class GaussianModel:
             self.mlp_feature_bank.train()
 
     def capture(self):
-        return (
-            self._anchor,
-            self._offset,
-            self._local,
-            self._scaling,
-            self._rotation,
-            self._opacity,
-            self.max_radii2D,
-            self.denom,
-            self.optimizer.state_dict(),
-            self.spatial_lr_scale,
-        )
+        state = {
+            "anchor": self._anchor,
+            "offset": self._offset,
+            "anchor_feat": self._anchor_feat,
+            "scaling": self._scaling,
+            "rotation": self._rotation,
+            "opacity": self._opacity,
+            "max_radii2D": self.max_radii2D,
+            "spatial_lr_scale": self.spatial_lr_scale,
+            "optimizer": self.optimizer.state_dict(),
+            "mlp_opacity": self.mlp_opacity.state_dict(),
+            "mlp_cov": self.mlp_cov.state_dict(),
+            "mlp_color": self.mlp_color.state_dict(),
+        }
+        if self.use_feat_bank:
+            state["mlp_feature_bank"] = self.mlp_feature_bank.state_dict()
+        if self.appearance_dim > 0 and self.embedding_appearance is not None:
+            state["embedding_appearance"] = self.embedding_appearance.state_dict()
+        for name in [
+            "anchor_residue_num_ema",
+            "anchor_residue_den_ema",
+            "anchor_residue_seen",
+            "anchor_active_offsets",
+            "anchor_visibility_ema",
+            "adaptive_residue_num_window",
+            "adaptive_residue_den_window",
+            "adaptive_seen_window",
+            "adaptive_high_count",
+            "adaptive_low_count",
+        ]:
+            value = getattr(self, name, None)
+            if value is not None and value.numel() > 0:
+                state[name] = value
+        return state
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._anchor, 
-        self._offset,
-        self._local,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        if not isinstance(model_args, dict):
+            raise ValueError("Unsupported legacy checkpoint format: expected dict model state")
+
+        self._anchor = nn.Parameter(model_args["anchor"].requires_grad_(True))
+        self._offset = nn.Parameter(model_args["offset"].requires_grad_(True))
+        self._anchor_feat = nn.Parameter(model_args["anchor_feat"].requires_grad_(True))
+        self._scaling = nn.Parameter(model_args["scaling"].requires_grad_(True))
+        self._rotation = nn.Parameter(model_args["rotation"].requires_grad_(True))
+        self._opacity = nn.Parameter(model_args["opacity"].requires_grad_(True))
+        self.max_radii2D = model_args["max_radii2D"]
+        self.spatial_lr_scale = model_args["spatial_lr_scale"]
+
+        self.mlp_opacity.load_state_dict(model_args["mlp_opacity"])
+        self.mlp_cov.load_state_dict(model_args["mlp_cov"])
+        self.mlp_color.load_state_dict(model_args["mlp_color"])
+        if self.use_feat_bank and "mlp_feature_bank" in model_args:
+            self.mlp_feature_bank.load_state_dict(model_args["mlp_feature_bank"])
+        if self.appearance_dim > 0 and "embedding_appearance" in model_args:
+            self.embedding_appearance.load_state_dict(model_args["embedding_appearance"])
+
         self.training_setup(training_args)
-        self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+        for name in [
+            "anchor_residue_num_ema",
+            "anchor_residue_den_ema",
+            "anchor_residue_seen",
+            "anchor_active_offsets",
+            "anchor_visibility_ema",
+            "adaptive_residue_num_window",
+            "adaptive_residue_den_window",
+            "adaptive_seen_window",
+            "adaptive_high_count",
+            "adaptive_low_count",
+        ]:
+            if name in model_args:
+                setattr(self, name, model_args[name])
+        self.optimizer.load_state_dict(model_args["optimizer"])
 
     def set_appearance(self, num_cameras):
         if self.appearance_dim > 0:
@@ -323,7 +368,12 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.use_adaptive_k = getattr(training_args, "use_adaptive_k", False)
-        self.use_residue_tracking = getattr(training_args, "use_residue_tracking", False) or self.use_adaptive_k
+        self.use_error_field = getattr(training_args, "use_error_field", False)
+        self.use_residue_tracking = (
+            getattr(training_args, "use_residue_tracking", False)
+            or self.use_adaptive_k
+            or self.use_error_field
+        )
         self.residue_ema = getattr(training_args, "residue_ema", 0.9)
         self.residue_min_den = getattr(training_args, "residue_min_den", 1.0)
         self.residue_div_eps = getattr(training_args, "residue_div_eps", 1e-8)
