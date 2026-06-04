@@ -471,6 +471,7 @@ class GaussianModel:
             l.append('f_offset_{}'.format(i))
         for i in range(self._anchor_feat.shape[1]):
             l.append('f_anchor_feat_{}'.format(i))
+        l.append('active_offsets')
         l.append('opacity')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
@@ -488,11 +489,15 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+        if getattr(self, 'use_adaptive_k', False) and self.anchor_active_offsets.numel() > 0:
+            active_offsets = self.anchor_active_offsets.detach().float().cpu().numpy()
+        else:
+            active_offsets = np.full((anchor.shape[0], 1), self.n_offsets, dtype=np.float32)
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(anchor.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((anchor, normals, offset, anchor_feat, active_offsets, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -530,10 +535,24 @@ class GaussianModel:
         for idx, attr_name in enumerate(offset_names):
             offsets[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
         offsets = offsets.reshape((offsets.shape[0], 3, -1))
-        
-        self._anchor_feat = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device="cuda").requires_grad_(True))
 
-        self._offset = nn.Parameter(torch.tensor(offsets, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+        property_names = {p.name for p in plydata.elements[0].properties}
+        if 'active_offsets' in property_names:
+            active_offsets = np.asarray(plydata.elements[0]['active_offsets']).astype(np.float32)
+            active_offsets = np.rint(active_offsets).astype(np.int64)
+            active_offsets = np.clip(active_offsets, 1, self.n_offsets)[..., np.newaxis]
+            self.anchor_active_offsets = torch.tensor(active_offsets, dtype=torch.long, device='cuda')
+            self.use_adaptive_k = bool((self.anchor_active_offsets < self.n_offsets).any().item())
+        else:
+            self.anchor_active_offsets = torch.empty((0, 1), dtype=torch.long, device='cuda')
+            self.use_adaptive_k = False
+        self.anchor_visibility_ema = torch.empty((0, 1), dtype=torch.float, device='cuda')
+        self.adaptive_high_count = torch.empty((0, 1), dtype=torch.long, device='cuda')
+        self.adaptive_low_count = torch.empty((0, 1), dtype=torch.long, device='cuda')
+        
+        self._anchor_feat = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device='cuda').requires_grad_(True))
+
+        self._offset = nn.Parameter(torch.tensor(offsets, dtype=torch.float, device='cuda').transpose(1, 2).contiguous().requires_grad_(True))
         self._anchor = nn.Parameter(torch.tensor(anchor, dtype=torch.float, device="cuda").requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
