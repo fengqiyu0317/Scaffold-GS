@@ -194,8 +194,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     tb_writer.add_scalar(f'{dataset_name}/adaptive_k/mean', active_k.mean().item(), iteration)
                     tb_writer.add_scalar(f'{dataset_name}/adaptive_k/min', active_k.min().item(), iteration)
                     tb_writer.add_scalar(f'{dataset_name}/adaptive_k/max', active_k.max().item(), iteration)
-                    if hasattr(gaussians, "anchor_visibility_ema") and gaussians.anchor_visibility_ema.numel() > 0:
-                        tb_writer.add_scalar(f'{dataset_name}/adaptive_k/visibility_mean', gaussians.anchor_visibility_ema.mean().item(), iteration)
+                    if hasattr(gaussians, "adaptive_residue_den_window") and gaussians.adaptive_residue_den_window.numel() > 0:
+                        observed_window = gaussians.adaptive_seen_window.squeeze(1) >= 1
+                        if observed_window.sum() > 0:
+                            tb_writer.add_scalar(f'{dataset_name}/adaptive_k/window_den_mean', gaussians.adaptive_residue_den_window[observed_window].mean().item(), iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/adaptive_k/window_seen_mean', gaussians.adaptive_seen_window[observed_window].mean().item(), iteration)
 
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
             if (iteration in saving_iterations):
@@ -233,6 +236,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     del gaussians.anchor_residue_seen
                 if getattr(gaussians, "use_adaptive_k", False):
                     del gaussians.anchor_visibility_ema
+                    del gaussians.adaptive_residue_num_window
+                    del gaussians.adaptive_residue_den_window
+                    del gaussians.adaptive_seen_window
                     del gaussians.adaptive_high_count
                     del gaussians.adaptive_low_count
                 torch.cuda.empty_cache()
