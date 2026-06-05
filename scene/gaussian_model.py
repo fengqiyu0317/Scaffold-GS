@@ -86,6 +86,8 @@ class GaussianModel:
         self.anchor_residue_num_ema = torch.empty(0)
         self.anchor_residue_den_ema = torch.empty(0)
         self.anchor_residue_seen = torch.empty(0)
+        self._anchor_uid = torch.empty(0, dtype=torch.long)
+        self._next_anchor_uid = 0
 
         self.use_adaptive_k = False
         self.use_error_field = False
@@ -168,6 +170,22 @@ class GaussianModel:
         if self.use_feat_bank:
             self.mlp_feature_bank.eval()
 
+    def _ensure_anchor_uid(self):
+        anchor_count = int(self.get_anchor.shape[0])
+        device = self.get_anchor.device
+        if self._anchor_uid.numel() != anchor_count:
+            self._anchor_uid = torch.arange(anchor_count, dtype=torch.long, device=device).view(-1, 1)
+            self._next_anchor_uid = anchor_count
+        else:
+            self._anchor_uid = self._anchor_uid.to(device=device, dtype=torch.long).view(-1, 1)
+            if self._anchor_uid.numel() > 0:
+                self._next_anchor_uid = max(self._next_anchor_uid, int(self._anchor_uid.max().item()) + 1)
+
+    @property
+    def get_anchor_uid(self):
+        self._ensure_anchor_uid()
+        return self._anchor_uid
+
     def train(self):
         self.mlp_opacity.train()
         self.mlp_cov.train()
@@ -196,6 +214,9 @@ class GaussianModel:
             state["mlp_feature_bank"] = self.mlp_feature_bank.state_dict()
         if self.appearance_dim > 0 and self.embedding_appearance is not None:
             state["embedding_appearance"] = self.embedding_appearance.state_dict()
+        if self._anchor_uid.numel() == self.get_anchor.shape[0]:
+            state["anchor_uid"] = self._anchor_uid
+            state["next_anchor_uid"] = torch.tensor(self._next_anchor_uid, device=self._anchor_uid.device)
         for name in [
             "anchor_residue_num_ema",
             "anchor_residue_den_ema",
@@ -249,6 +270,16 @@ class GaussianModel:
         ]:
             if name in model_args:
                 setattr(self, name, model_args[name])
+        if "anchor_uid" in model_args and model_args["anchor_uid"].numel() == self.get_anchor.shape[0]:
+            self._anchor_uid = model_args["anchor_uid"].to(device=self.get_anchor.device, dtype=torch.long).view(-1, 1)
+            if "next_anchor_uid" in model_args:
+                self._next_anchor_uid = int(model_args["next_anchor_uid"].item())
+            elif self._anchor_uid.numel() > 0:
+                self._next_anchor_uid = int(self._anchor_uid.max().item()) + 1
+            else:
+                self._next_anchor_uid = 0
+        else:
+            self._ensure_anchor_uid()
         self.optimizer.load_state_dict(model_args["optimizer"])
 
     def set_appearance(self, num_cameras):
@@ -397,6 +428,7 @@ class GaussianModel:
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self._ensure_anchor_uid()
         if self.use_residue_tracking:
             self.anchor_residue_num_ema = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
             self.anchor_residue_den_ema = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
@@ -954,6 +986,16 @@ class GaussianModel:
                 del self.opacity_accum
                 self.opacity_accum = temp_opacity_accum
 
+                self._ensure_anchor_uid()
+                new_uid = torch.arange(
+                    self._next_anchor_uid,
+                    self._next_anchor_uid + new_opacities.shape[0],
+                    dtype=torch.long,
+                    device=self._anchor_uid.device,
+                ).view(-1, 1)
+                self._next_anchor_uid += int(new_opacities.shape[0])
+                self._anchor_uid = torch.cat([self._anchor_uid, new_uid], dim=0)
+
                 if self.use_residue_tracking:
                     zeros = torch.zeros([new_opacities.shape[0], 1], device="cuda").float()
                     self.anchor_residue_num_ema = torch.cat([self.anchor_residue_num_ema, zeros.clone()], dim=0)
@@ -1056,6 +1098,11 @@ class GaussianModel:
             self.anchor_residue_num_ema = temp_residue_num
             self.anchor_residue_den_ema = temp_residue_den
             self.anchor_residue_seen = temp_residue_seen
+
+        if self._anchor_uid.numel() == prune_mask.shape[0]:
+            temp_anchor_uid = self._anchor_uid[~prune_mask]
+            del self._anchor_uid
+            self._anchor_uid = temp_anchor_uid
 
         if self.use_adaptive_k:
             temp_active_offsets = self.anchor_active_offsets[~prune_mask]

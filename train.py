@@ -70,6 +70,203 @@ def build_residue_error_map(image, gt_image, opt):
     lambda_dssim = float(getattr(opt, "lambda_dssim", 0.2))
     return ((1.0 - lambda_dssim) * l1_map + lambda_dssim * ssim_map).contiguous()
 
+
+def parse_error_field_validation_deltas(value):
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.split(',') if p.strip()]
+    else:
+        parts = [value]
+    deltas = sorted({int(p) for p in parts if int(p) > 0})
+    return deltas
+
+
+def _normalize_anchor_residual(gaussians, eps):
+    residue_seen = gaussians.anchor_residue_seen.detach().view(-1)
+    residue_den = gaussians.anchor_residue_den_ema.detach().view(-1)
+    residue_num = gaussians.anchor_residue_num_ema.detach().view(-1)
+    valid = torch.logical_and(residue_seen > 0, residue_den > 0)
+    residual_raw = torch.zeros_like(residue_den)
+    residual_raw[valid] = residue_num[valid] / residue_den[valid].clamp_min(eps)
+    residual_norm = torch.zeros_like(residual_raw)
+    if int(valid.sum().item()) >= 2:
+        valid_residual = residual_raw[valid]
+        r_low = torch.quantile(valid_residual, 0.30)
+        r_high = torch.quantile(valid_residual, 0.90)
+        residual_norm[valid] = torch.clamp((residual_raw[valid] - r_low) / (r_high - r_low + eps), 0.0, 1.0)
+    return valid, residual_norm
+
+
+def _anchor_gradient_and_grow_candidate(gaussians, opt):
+    anchor_count = int(gaussians.get_anchor.shape[0])
+    required = anchor_count * int(gaussians.n_offsets)
+    if gaussians.offset_gradient_accum.numel() < required or gaussians.offset_denom.numel() < required:
+        device = gaussians.get_anchor.device
+        return torch.full((anchor_count,), float('nan'), device=device), torch.zeros(anchor_count, dtype=torch.bool, device=device)
+
+    grad_accum = gaussians.offset_gradient_accum.detach()[:required].float().view(required, -1)
+    denom = gaussians.offset_denom.detach()[:required].float().view(required, -1)
+    grads = grad_accum / denom.clamp_min(1.0)
+    grads[torch.isnan(grads)] = 0.0
+    grads_norm = torch.norm(grads, dim=-1).view(anchor_count, int(gaussians.n_offsets))
+    denom_by_anchor = denom.view(anchor_count, int(gaussians.n_offsets), -1).squeeze(-1)
+    offset_mask = denom_by_anchor > float(opt.update_interval) * float(opt.success_threshold) * 0.5
+    grow_offset = torch.logical_and(grads_norm >= float(opt.densify_grad_threshold), offset_mask)
+    return grads_norm.max(dim=1).values, grow_offset.any(dim=1)
+
+
+def _uid_membership(values, members):
+    values = values.detach().view(-1).long()
+    members = members.detach().view(-1).long()
+    if members.numel() == 0 or values.numel() == 0:
+        return torch.zeros_like(values, dtype=torch.bool)
+    max_uid = int(torch.maximum(values.max(), members.max()).item())
+    lookup = torch.zeros(max_uid + 1, dtype=torch.bool, device=values.device)
+    lookup[members.to(values.device)] = True
+    return lookup[values]
+
+
+def _current_anchor_validation_state(gaussians, opt):
+    valid, residual_norm = _normalize_anchor_residual(gaussians, float(opt.residue_div_eps))
+    gradient_score, grow_candidate = _anchor_gradient_and_grow_candidate(gaussians, opt)
+    return {
+        'uid': gaussians.get_anchor_uid.detach().view(-1).long(),
+        'valid': valid,
+        'residual_norm': residual_norm,
+        'gradient_score': gradient_score,
+        'grow_candidate': grow_candidate,
+    }
+
+
+def freeze_error_field_validation_snapshot(error_field, gaussians, bbox_min, bbox_max, iteration, opt, logger=None):
+    state = _current_anchor_validation_state(gaussians, opt)
+    valid = state['valid']
+    valid_count = int(valid.sum().item())
+    if valid_count < 2:
+        return None
+
+    error_field.eval()
+    anchor_pos = gaussians.get_anchor.detach()
+    pred_chunks = []
+    chunk = 65536
+    eps = float(opt.residue_div_eps)
+    for start in range(0, anchor_pos.shape[0], chunk):
+        x_norm = torch.clamp((anchor_pos[start:start + chunk] - bbox_min) / (bbox_max - bbox_min + eps), 0.0, 1.0)
+        pred_chunks.append(error_field(x_norm).detach())
+    pred_error = torch.cat(pred_chunks, dim=0)
+
+    high_quantile = float(getattr(opt, 'error_field_validation_high_quantile', 0.9))
+    threshold = torch.quantile(pred_error[valid].view(-1), high_quantile)
+    high = torch.logical_and(valid, pred_error > threshold)
+    if int(high.sum().item()) == 0:
+        high = torch.logical_and(valid, pred_error >= threshold)
+    other = torch.logical_and(valid, ~high)
+    deltas = parse_error_field_validation_deltas(getattr(opt, 'error_field_validation_deltas', '100,500,1000'))
+    if not deltas:
+        return None
+
+    snapshot = {
+        'origin_iter': int(iteration),
+        'due_iters': [int(iteration) + d for d in deltas],
+        'reported_due_iters': set(),
+        'high_uid': state['uid'][high].detach().clone(),
+        'other_uid': state['uid'][other].detach().clone(),
+        'pred_error_threshold': float(threshold.detach().item()),
+        'high_quantile': high_quantile,
+        'valid_anchor_count_t': valid_count,
+        'high_anchor_count_t': int(high.sum().item()),
+        'other_anchor_count_t': int(other.sum().item()),
+        'accum': {
+            'high_residual_sum': 0.0,
+            'other_residual_sum': 0.0,
+            'high_gradient_sum': 0.0,
+            'other_gradient_sum': 0.0,
+            'high_grow_sum': 0.0,
+            'other_grow_sum': 0.0,
+            'high_count': 0,
+            'other_count': 0,
+            'high_gradient_count': 0,
+            'other_gradient_count': 0,
+            'high_grow_count': 0,
+            'other_grow_count': 0,
+        },
+    }
+    if logger:
+        logger.info(
+            '[ITER {}] Freeze error-field validation: high {}/{} anchors at q{:.2f}; due {}'.format(
+                iteration, snapshot['high_anchor_count_t'], valid_count, high_quantile, deltas
+            )
+        )
+    return snapshot
+
+
+def _accumulate_group(accum, prefix, state, mask):
+    mask = torch.logical_and(mask, state['valid'])
+    count = int(mask.sum().item())
+    if count <= 0:
+        return
+    accum[f'{prefix}_residual_sum'] += float(state['residual_norm'][mask].sum().detach().item())
+    accum[f'{prefix}_count'] += count
+
+    gradient = state['gradient_score']
+    grad_mask = torch.logical_and(mask, torch.isfinite(gradient))
+    grad_count = int(grad_mask.sum().item())
+    if grad_count > 0:
+        accum[f'{prefix}_gradient_sum'] += float(gradient[grad_mask].sum().detach().item())
+        accum[f'{prefix}_gradient_count'] += grad_count
+
+    accum[f'{prefix}_grow_sum'] += float(state['grow_candidate'][mask].float().sum().detach().item())
+    accum[f'{prefix}_grow_count'] += count
+
+
+def update_error_field_validation_snapshots(pending, gaussians, opt, iteration, tb_writer=None, logger=None, dataset_name=None):
+    if not pending:
+        return []
+    state = _current_anchor_validation_state(gaussians, opt)
+    active = []
+    for snapshot in pending:
+        if iteration <= snapshot['origin_iter']:
+            active.append(snapshot)
+            continue
+        high_mask = _uid_membership(state['uid'], snapshot['high_uid'])
+        other_mask = _uid_membership(state['uid'], snapshot['other_uid'])
+        _accumulate_group(snapshot['accum'], 'high', state, high_mask)
+        _accumulate_group(snapshot['accum'], 'other', state, other_mask)
+
+        for due_iter in snapshot['due_iters']:
+            if iteration < due_iter or due_iter in snapshot['reported_due_iters']:
+                continue
+            accum = snapshot['accum']
+            high_res = accum['high_residual_sum'] / max(accum['high_count'], 1)
+            other_res = accum['other_residual_sum'] / max(accum['other_count'], 1)
+            high_grad = accum['high_gradient_sum'] / max(accum['high_gradient_count'], 1)
+            other_grad = accum['other_gradient_sum'] / max(accum['other_gradient_count'], 1)
+            high_grow = accum['high_grow_sum'] / max(accum['high_grow_count'], 1)
+            other_grow = accum['other_grow_sum'] / max(accum['other_grow_count'], 1)
+            delta = int(due_iter - snapshot['origin_iter'])
+            if tb_writer:
+                prefix = f'{dataset_name}/error_field_lag{delta}'
+                tb_writer.add_scalar(f'{prefix}/high_residual_future_mean', high_res, iteration)
+                tb_writer.add_scalar(f'{prefix}/other_residual_future_mean', other_res, iteration)
+                tb_writer.add_scalar(f'{prefix}/residual_future_delta', high_res - other_res, iteration)
+                tb_writer.add_scalar(f'{prefix}/high_gradient_future_mean', high_grad, iteration)
+                tb_writer.add_scalar(f'{prefix}/other_gradient_future_mean', other_grad, iteration)
+                tb_writer.add_scalar(f'{prefix}/gradient_future_delta', high_grad - other_grad, iteration)
+                tb_writer.add_scalar(f'{prefix}/high_grow_candidate_rate_window', high_grow, iteration)
+                tb_writer.add_scalar(f'{prefix}/other_grow_candidate_rate_window', other_grow, iteration)
+                tb_writer.add_scalar(f'{prefix}/grow_candidate_rate_window_delta', high_grow - other_grow, iteration)
+            if logger:
+                logger.info(
+                    '[ITER {}] Error-field delayed validation t={} Δ={}: residual {:.4f} vs {:.4f}, '
+                    'gradient {:.6f} vs {:.6f}, grow_rate {:.4f} vs {:.4f}'.format(
+                        iteration, snapshot['origin_iter'], delta,
+                        high_res, other_res, high_grad, other_grad, high_grow, other_grow,
+                    )
+                )
+            snapshot['reported_due_iters'].add(due_iter)
+        if len(snapshot['reported_due_iters']) < len(snapshot['due_iters']):
+            active.append(snapshot)
+    return active
+
 def saveRuntimeCode(dst: str) -> None:
     additionalIgnorePatterns = ['.git', '.gitignore']
     ignorePatterns = set()
@@ -122,6 +319,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
+    pending_error_field_validations = []
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
@@ -283,6 +481,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     neural_anchor_indices=None if residue_pkg is None else residue_pkg.get("neural_anchor_indices", None),
                 )
 
+                pending_error_field_validations = update_error_field_validation_snapshots(
+                    pending_error_field_validations,
+                    gaussians,
+                    opt,
+                    iteration,
+                    tb_writer=tb_writer,
+                    logger=logger,
+                    dataset_name=dataset_name,
+                )
+
                 if (opt.use_error_field and error_field is not None
                         and iteration >= opt.error_field_start
                         and iteration % opt.error_field_interval == 0
@@ -324,6 +532,19 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                             tb_writer.add_scalar(f'{dataset_name}/error_field/corr_pred_target', error_stats["corr_pred_target"], iteration)
                             tb_writer.add_scalar(f'{dataset_name}/error_field/top10_overlap', error_stats["top10_overlap"], iteration)
                             tb_writer.add_scalar(f'{dataset_name}/error_field/weight_mean', error_stats["weight_mean"], iteration)
+                        if (int(getattr(opt, "error_field_validation_interval", 100)) > 0
+                                and iteration % int(getattr(opt, "error_field_validation_interval", 100)) == 0):
+                            validation_snapshot = freeze_error_field_validation_snapshot(
+                                error_field,
+                                gaussians,
+                                error_field_bbox_min,
+                                error_field_bbox_max,
+                                iteration,
+                                opt,
+                                logger=logger,
+                            )
+                            if validation_snapshot is not None:
+                                pending_error_field_validations.append(validation_snapshot)
                     elif tb_writer and error_stats:
                         tb_writer.add_scalar(f'{dataset_name}/error_field/valid_anchors', error_stats.get("valid_anchors", 0), iteration)
                     if logger and error_stats and not error_stats.get("skipped", False):

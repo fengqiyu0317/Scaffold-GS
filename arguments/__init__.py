@@ -184,16 +184,19 @@ class OptimizationParams(ParamGroup):
         self.use_error_field = False
         self.error_field_start = 3000
         self.error_field_interval = 20
-        self.error_field_steps = 10
+        self.error_field_steps = 50
         self.error_field_lr = 1e-3
         self.error_field_num_freqs = 6
         self.error_field_hidden_dim = 64
         self.error_field_batch_size = 8192
-        self.error_field_sparse_weight = 0.02
-        self.error_field_smooth_weight = 0.01
-        self.error_field_jitter_std = 0.01
+        self.error_field_sparse_weight = 0.001
+        self.error_field_smooth_weight = 0.0
+        self.error_field_jitter_std = 0.0
         self.error_field_query_resolution = 64
         self.error_field_score_threshold = 0.7
+        self.error_field_validation_interval = 100
+        self.error_field_validation_deltas = "100,500,1000"
+        self.error_field_validation_high_quantile = 0.9
 
         super().__init__(parser, "Optimization Parameters")
 
