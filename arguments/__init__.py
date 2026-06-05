@@ -198,6 +198,14 @@ class OptimizationParams(ParamGroup):
         self.error_field_validation_deltas = "100,500,1000"
         self.error_field_validation_high_quantile = 0.9
 
+        # Optional conservative error-field-aware anchor growing. Disabled by
+        # default so baseline/error-field visualization behavior is unchanged.
+        self.use_error_field_anchor_grow = False
+        self.error_field_grow_weight = 0.5
+        self.error_field_grow_high_quantile = 0.9
+        self.error_field_grow_min_residual = 0.7
+        self.error_field_grow_reliability_factor = 0.5
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

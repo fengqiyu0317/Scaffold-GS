@@ -199,6 +199,74 @@ def freeze_error_field_validation_snapshot(error_field, gaussians, bbox_min, bbo
     return snapshot
 
 
+def compute_error_field_anchor_grow_boost(error_field, gaussians, bbox_min, bbox_max, opt):
+    stats = {
+        "enabled": False,
+        "valid_anchors": 0,
+        "pred_gate_count": 0,
+        "residual_gate_count": 0,
+        "reliable_count": 0,
+        "boosted_count": 0,
+        "boost_mean": 1.0,
+        "boost_max": 1.0,
+    }
+    if not getattr(opt, "use_error_field_anchor_grow", False):
+        return None, stats
+    if error_field is None or bbox_min is None or bbox_max is None:
+        return None, stats
+    if not hasattr(gaussians, "anchor_residue_seen") or gaussians.anchor_residue_seen.numel() == 0:
+        return None, stats
+
+    valid, residual_norm = _normalize_anchor_residual(gaussians, float(opt.residue_div_eps))
+    valid_count = int(valid.sum().item())
+    stats["enabled"] = True
+    stats["valid_anchors"] = valid_count
+    if valid_count < 2:
+        return None, stats
+
+    anchor_pos = gaussians.get_anchor.detach()
+    pred_chunks = []
+    chunk = 65536
+    eps = float(opt.residue_div_eps)
+    was_training = error_field.training
+    error_field.eval()
+    for start in range(0, anchor_pos.shape[0], chunk):
+        x_norm = torch.clamp((anchor_pos[start:start + chunk] - bbox_min) / (bbox_max - bbox_min + eps), 0.0, 1.0)
+        pred_chunks.append(error_field(x_norm).detach().view(-1))
+    if was_training:
+        error_field.train()
+    pred_error = torch.cat(pred_chunks, dim=0)
+
+    high_quantile = float(getattr(opt, "error_field_grow_high_quantile", 0.9))
+    high_quantile = min(max(high_quantile, 0.0), 1.0)
+    threshold = torch.quantile(pred_error[valid].view(-1), high_quantile)
+    pred_gate = torch.logical_and(valid, pred_error >= threshold)
+    residual_gate = torch.logical_and(valid, residual_norm >= float(getattr(opt, "error_field_grow_min_residual", 0.7)))
+
+    reliability_factor = float(getattr(opt, "error_field_grow_reliability_factor", 0.5))
+    reliability_threshold = float(opt.update_interval) * float(opt.success_threshold) * reliability_factor
+    if hasattr(gaussians, "anchor_demon") and gaussians.anchor_demon.numel() == pred_error.numel():
+        reliable = gaussians.anchor_demon.detach().view(-1) > reliability_threshold
+    else:
+        reliable = valid
+
+    grow_anchor = pred_gate & residual_gate & reliable
+    boost = torch.ones_like(pred_error)
+    if int(grow_anchor.sum().item()) > 0:
+        boost[grow_anchor] = 1.0 + float(getattr(opt, "error_field_grow_weight", 0.5)) * pred_error[grow_anchor] * residual_norm[grow_anchor]
+
+    stats.update({
+        "pred_threshold": float(threshold.detach().item()),
+        "pred_gate_count": int(pred_gate.sum().item()),
+        "residual_gate_count": int(residual_gate.sum().item()),
+        "reliable_count": int(torch.logical_and(valid, reliable).sum().item()),
+        "boosted_count": int(grow_anchor.sum().item()),
+        "boost_mean": float(boost.mean().detach().item()),
+        "boost_max": float(boost.max().detach().item()),
+    })
+    return boost, stats
+
+
 def _accumulate_group(accum, prefix, state, mask):
     mask = torch.logical_and(mask, state['valid'])
     count = int(mask.sum().item())
@@ -575,7 +643,40 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
                 # densification
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
-                    gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity)
+                    anchor_grow_boost, grow_boost_stats = compute_error_field_anchor_grow_boost(
+                        error_field,
+                        gaussians,
+                        error_field_bbox_min,
+                        error_field_bbox_max,
+                        opt,
+                    )
+                    if tb_writer and grow_boost_stats.get("enabled", False):
+                        tb_writer.add_scalar(f"{dataset_name}/error_field_grow/boosted_anchors", grow_boost_stats.get("boosted_count", 0), iteration)
+                        tb_writer.add_scalar(f"{dataset_name}/error_field_grow/boost_mean", grow_boost_stats.get("boost_mean", 1.0), iteration)
+                        tb_writer.add_scalar(f"{dataset_name}/error_field_grow/boost_max", grow_boost_stats.get("boost_max", 1.0), iteration)
+                        tb_writer.add_scalar(f"{dataset_name}/error_field_grow/pred_gate_count", grow_boost_stats.get("pred_gate_count", 0), iteration)
+                        tb_writer.add_scalar(f"{dataset_name}/error_field_grow/residual_gate_count", grow_boost_stats.get("residual_gate_count", 0), iteration)
+                        tb_writer.add_scalar(f"{dataset_name}/error_field_grow/reliable_count", grow_boost_stats.get("reliable_count", 0), iteration)
+                    if logger and grow_boost_stats.get("enabled", False):
+                        logger.info(
+                            "[ITER {}] Error-field grow boost: boosted {}/{} anchors, pred_gate {}, residual_gate {}, reliable {}, boost mean {:.4f}, max {:.4f}".format(
+                                iteration,
+                                grow_boost_stats.get("boosted_count", 0),
+                                grow_boost_stats.get("valid_anchors", 0),
+                                grow_boost_stats.get("pred_gate_count", 0),
+                                grow_boost_stats.get("residual_gate_count", 0),
+                                grow_boost_stats.get("reliable_count", 0),
+                                grow_boost_stats.get("boost_mean", 1.0),
+                                grow_boost_stats.get("boost_max", 1.0),
+                            )
+                        )
+                    gaussians.adjust_anchor(
+                        check_interval=opt.update_interval,
+                        success_threshold=opt.success_threshold,
+                        grad_threshold=opt.densify_grad_threshold,
+                        min_opacity=opt.min_opacity,
+                        anchor_grow_boost=anchor_grow_boost,
+                    )
             elif iteration == opt.update_until:
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum

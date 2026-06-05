@@ -1026,14 +1026,22 @@ class GaussianModel:
                 
 
 
-    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
+    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005, anchor_grow_boost=None):
         # # adding anchors
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
+
+        grow_scores = grads_norm
+        if anchor_grow_boost is not None:
+            anchor_grow_boost = anchor_grow_boost.detach().to(device=grow_scores.device, dtype=grow_scores.dtype).view(-1)
+            expected_anchor_count = int(self.get_anchor.shape[0])
+            if anchor_grow_boost.numel() == expected_anchor_count:
+                offset_boost = anchor_grow_boost.repeat_interleave(self.n_offsets)[:grow_scores.shape[0]]
+                grow_scores = grow_scores * offset_boost
         
-        self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+        self.anchor_growing(grow_scores, grad_threshold, offset_mask)
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0
