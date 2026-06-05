@@ -37,7 +37,13 @@ from utils.loss_utils import l1_loss, ssim, ssim_error_map
 from gaussian_renderer import prefilter_voxel, render, network_gui
 import sys
 from scene import Scene, GaussianModel
-from scene.error_field import ErrorField, save_error_field_checkpoint, save_error_points_ply, train_error_field_steps
+from scene.error_field import (
+    ErrorField,
+    save_anchor_error_visualization_ply,
+    save_error_field_checkpoint,
+    save_error_points_ply,
+    train_error_field_steps,
+)
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
@@ -229,8 +235,43 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         resolution=opt.error_field_query_resolution,
                         threshold=opt.error_field_score_threshold,
                     )
+                    anchor_vis_stats = None
+                    if (hasattr(gaussians, "anchor_residue_seen")
+                            and gaussians.anchor_residue_seen.numel() > 0):
+                        anchor_vis_stats = save_anchor_error_visualization_ply(
+                            error_field=error_field,
+                            anchor_pos=gaussians.get_anchor,
+                            residue_num_ema=gaussians.anchor_residue_num_ema,
+                            residue_den_ema=gaussians.anchor_residue_den_ema,
+                            residue_seen=gaussians.anchor_residue_seen,
+                            bbox_min=error_field_bbox_min,
+                            bbox_max=error_field_bbox_max,
+                            output_dir=os.path.join(error_field_dir, "anchor_visualization"),
+                            iteration=iteration,
+                            eps=opt.residue_div_eps,
+                        )
                     if tb_writer:
                         tb_writer.add_scalar(f'{dataset_name}/error_field/exported_points', exported_points, iteration)
+                        if anchor_vis_stats and not anchor_vis_stats.get("skipped", False):
+                            tb_writer.add_scalar(
+                                f'{dataset_name}/error_field/anchor_vis_corr',
+                                anchor_vis_stats["corr_pred_error_vs_residual_norm_valid"],
+                                iteration,
+                            )
+                            tb_writer.add_scalar(
+                                f'{dataset_name}/error_field/anchor_vis_top10_overlap',
+                                anchor_vis_stats["top10_overlap"],
+                                iteration,
+                            )
+                    if logger and anchor_vis_stats and not anchor_vis_stats.get("skipped", False):
+                        logger.info(
+                            "[ITER {}] Error field anchor PLY: corr {:.4f}, top10 {:.4f}, valid {}".format(
+                                iteration,
+                                anchor_vis_stats["corr_pred_error_vs_residual_norm_valid"],
+                                anchor_vis_stats["top10_overlap"],
+                                anchor_vis_stats["valid_residual_anchor_count"],
+                            )
+                        )
             
             # densification
             if iteration < opt.update_until and iteration > opt.start_stat:
@@ -318,7 +359,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
                 del gaussians.offset_denom
-                if getattr(gaussians, "use_residue_tracking", False):
+                if getattr(gaussians, "use_residue_tracking", False) and not opt.use_error_field:
                     del gaussians.anchor_residue_num_ema
                     del gaussians.anchor_residue_den_ema
                     del gaussians.anchor_residue_seen

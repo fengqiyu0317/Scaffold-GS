@@ -1,3 +1,4 @@
+import json
 import os
 
 import torch
@@ -226,6 +227,151 @@ def save_error_points_ply(error_field, bbox_min, bbox_max, path, resolution=64, 
         for p, s in zip(xyz_cpu.tolist(), score_cpu.tolist()):
             f.write('{:.8f} {:.8f} {:.8f} {:.8f}\n'.format(p[0], p[1], p[2], s))
     return int(xyz_cpu.shape[0])
+
+
+def _scalar_to_rgb(values):
+    values = torch.clamp(values.float(), 0.0, 1.0)
+    red = torch.clamp(1.5 - torch.abs(4.0 * values - 3.0), 0.0, 1.0)
+    green = torch.clamp(1.5 - torch.abs(4.0 * values - 2.0), 0.0, 1.0)
+    blue = torch.clamp(1.5 - torch.abs(4.0 * values - 1.0), 0.0, 1.0)
+    return torch.round(torch.stack([red, green, blue], dim=1) * 255.0).to(torch.uint8)
+
+
+def _quantile_summary(values):
+    return {
+        str(q): float(_safe_quantile(values, q).detach().item())
+        for q in (0.0, 0.5, 0.9, 0.95, 1.0)
+    }
+
+
+def _write_anchor_scalar_ply(path, xyz, color_values, scalar_name, scalar_values,
+                             residual_norm, residual_raw, pred_error, residue_den, residue_seen):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    xyz_cpu = xyz.detach().cpu().float()
+    colors = _scalar_to_rgb(color_values.detach().cpu())
+    scalar_cpu = scalar_values.detach().cpu().float()
+    residual_norm_cpu = residual_norm.detach().cpu().float()
+    residual_raw_cpu = residual_raw.detach().cpu().float()
+    pred_error_cpu = pred_error.detach().cpu().float()
+    residue_den_cpu = residue_den.detach().cpu().float()
+    residue_seen_cpu = residue_seen.detach().cpu().float()
+
+    with open(path, 'w') as f:
+        f.write('ply\n')
+        f.write('format ascii 1.0\n')
+        f.write('element vertex {}\n'.format(xyz_cpu.shape[0]))
+        f.write('property float x\n')
+        f.write('property float y\n')
+        f.write('property float z\n')
+        f.write('property uchar red\n')
+        f.write('property uchar green\n')
+        f.write('property uchar blue\n')
+        f.write('property float {}\n'.format(scalar_name))
+        f.write('property float residual_norm\n')
+        f.write('property float residual_raw\n')
+        f.write('property float pred_error\n')
+        f.write('property float residue_den\n')
+        f.write('property float residue_seen\n')
+        f.write('end_header\n')
+        for p, c, s, rn, rr, pe, den, seen in zip(
+                xyz_cpu.tolist(), colors.tolist(), scalar_cpu.tolist(),
+                residual_norm_cpu.tolist(), residual_raw_cpu.tolist(),
+                pred_error_cpu.tolist(), residue_den_cpu.tolist(), residue_seen_cpu.tolist()):
+            f.write(
+                '{:.8f} {:.8f} {:.8f} {} {} {} {:.8f} {:.8f} {:.8f} {:.8f} {:.8f} {:.8f}\n'.format(
+                    p[0], p[1], p[2], c[0], c[1], c[2], s, rn, rr, pe, den, seen
+                )
+            )
+
+
+@torch.no_grad()
+def save_anchor_error_visualization_ply(
+    error_field,
+    anchor_pos,
+    residue_num_ema,
+    residue_den_ema,
+    residue_seen,
+    bbox_min,
+    bbox_max,
+    output_dir,
+    iteration,
+    eps=1e-8,
+    chunk=65536,
+):
+    anchor_pos = anchor_pos.detach()
+    residue_num = residue_num_ema.detach().view(-1)
+    residue_den = residue_den_ema.detach().view(-1)
+    residue_seen = residue_seen.detach().view(-1)
+    valid = torch.logical_and(residue_seen > 0, residue_den > 0)
+    valid_count = int(valid.sum().item())
+    if valid_count < 2:
+        return {'skipped': True, 'valid_anchors': valid_count}
+
+    residual_raw = torch.zeros_like(residue_den)
+    residual_raw[valid] = residue_num[valid] / residue_den[valid].clamp_min(eps)
+    valid_residual = residual_raw[valid]
+    r_low = _safe_quantile(valid_residual, 0.30)
+    r_high = _safe_quantile(valid_residual, 0.90)
+    residual_norm = torch.zeros_like(residual_raw)
+    residual_norm[valid] = torch.clamp(
+        (residual_raw[valid] - r_low) / (r_high - r_low + eps),
+        0.0,
+        1.0,
+    )
+
+    error_field.eval()
+    pred_chunks = []
+    for start in range(0, anchor_pos.shape[0], int(chunk)):
+        x_norm = _normalize_xyz(anchor_pos[start:start + int(chunk)], bbox_min, bbox_max, eps)
+        pred_chunks.append(error_field(x_norm).detach())
+    pred_error = torch.cat(pred_chunks, dim=0)
+
+    pred_valid = pred_error[valid]
+    target_valid = residual_norm[valid]
+    pred_std = pred_valid.std(unbiased=False)
+    target_std = target_valid.std(unbiased=False)
+    if pred_valid.numel() >= 2 and pred_std > eps and target_std > eps:
+        corr = torch.corrcoef(torch.stack([pred_valid, target_valid]))[0, 1]
+    else:
+        corr = torch.tensor(float('nan'), device=pred_valid.device)
+    top10_overlap = _topk_overlap(pred_valid, target_valid, 0.10)
+    top5_overlap = _topk_overlap(pred_valid, target_valid, 0.05)
+
+    os.makedirs(output_dir, exist_ok=True)
+    pred_path = os.path.join(output_dir, 'anchors_colored_by_error_field_{}.ply'.format(iteration))
+    residual_path = os.path.join(output_dir, 'anchors_colored_by_residual_{}.ply'.format(iteration))
+    _write_anchor_scalar_ply(
+        pred_path, anchor_pos, pred_error, 'error_field_score', pred_error,
+        residual_norm, residual_raw, pred_error, residue_den, residue_seen,
+    )
+    _write_anchor_scalar_ply(
+        residual_path, anchor_pos, residual_norm, 'residual_color_score', residual_norm,
+        residual_norm, residual_raw, pred_error, residue_den, residue_seen,
+    )
+
+    summary = {
+        'skipped': False,
+        'iteration': int(iteration),
+        'anchor_count': int(anchor_pos.shape[0]),
+        'valid_residual_anchor_count': valid_count,
+        'residual_raw_quantiles_valid': _quantile_summary(valid_residual),
+        'residual_norm_quantiles_valid': _quantile_summary(target_valid),
+        'pred_error_quantiles_valid': _quantile_summary(pred_valid),
+        'corr_pred_error_vs_residual_norm_valid': float(corr.detach().item()),
+        'top10_overlap': float(top10_overlap.detach().item()),
+        'top5_overlap': float(top5_overlap.detach().item()),
+        'bbox_min': [float(x) for x in bbox_min.detach().cpu().tolist()],
+        'bbox_max': [float(x) for x in bbox_max.detach().cpu().tolist()],
+        'outputs': {
+            'pred_error_ply': pred_path,
+            'residual_ply': residual_path,
+        },
+    }
+    summary_path = os.path.join(output_dir, 'anchor_error_visualization_summary_{}.json'.format(iteration))
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    summary['summary_path'] = summary_path
+    return summary
 
 
 def save_error_field_checkpoint(error_field, error_optim, bbox_min, bbox_max, path, iteration, opt):
