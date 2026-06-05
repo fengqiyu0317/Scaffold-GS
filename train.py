@@ -272,8 +272,36 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                             tb_writer.add_scalar(f'{dataset_name}/error_field/loss_sparse', error_stats["loss_sparse"], iteration)
                             tb_writer.add_scalar(f'{dataset_name}/error_field/loss_smooth', error_stats["loss_smooth"], iteration)
                             tb_writer.add_scalar(f'{dataset_name}/error_field/valid_anchors', error_stats["valid_anchors"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/target_min', error_stats["target_min"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/target_mean', error_stats["target_mean"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/target_max', error_stats["target_max"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/target_std', error_stats["target_std"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/pred_min', error_stats["pred_min"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/pred_mean', error_stats["pred_mean"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/pred_max', error_stats["pred_max"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/pred_std', error_stats["pred_std"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/corr_pred_target', error_stats["corr_pred_target"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/top10_overlap', error_stats["top10_overlap"], iteration)
+                            tb_writer.add_scalar(f'{dataset_name}/error_field/weight_mean', error_stats["weight_mean"], iteration)
                     elif tb_writer and error_stats:
                         tb_writer.add_scalar(f'{dataset_name}/error_field/valid_anchors', error_stats.get("valid_anchors", 0), iteration)
+                    if logger and error_stats and not error_stats.get("skipped", False):
+                        logger.info(
+                            "[ITER {}] Error field: loss {:.6f}, corr {:.4f}, top10 {:.4f}, "
+                            "target [{:.4f}, {:.4f}, {:.4f}], pred [{:.4f}, {:.4f}, {:.4f}], valid {}".format(
+                                iteration,
+                                error_stats["loss"],
+                                error_stats["corr_pred_target"],
+                                error_stats["top10_overlap"],
+                                error_stats["target_min"],
+                                error_stats["target_mean"],
+                                error_stats["target_max"],
+                                error_stats["pred_min"],
+                                error_stats["pred_mean"],
+                                error_stats["pred_max"],
+                                error_stats["valid_anchors"],
+                            )
+                        )
                 
                 if (opt.use_adaptive_k and iteration > opt.update_from
                         and iteration % opt.adaptive_k_update_interval == 0):

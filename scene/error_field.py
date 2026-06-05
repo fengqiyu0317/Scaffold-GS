@@ -44,6 +44,18 @@ def _safe_quantile(values, q):
     return torch.quantile(values.view(-1), q)
 
 
+def _topk_overlap(pred, target, fraction=0.10):
+    count = int(target.numel())
+    if count <= 0:
+        return torch.tensor(float('nan'), device=target.device)
+    k = max(1, int(float(fraction) * count))
+    pred_top = torch.topk(pred.view(-1), k, largest=True).indices
+    target_top = torch.topk(target.view(-1), k, largest=True).indices
+    target_mask = torch.zeros(count, dtype=torch.bool, device=target.device)
+    target_mask[target_top] = True
+    return target_mask[pred_top].float().mean()
+
+
 def train_error_field_steps(
     error_field,
     error_optim,
@@ -127,6 +139,16 @@ def train_error_field_steps(
         loss.backward()
         error_optim.step()
 
+        with torch.no_grad():
+            pred_all = error_field(X_norm_all)
+            pred_std = pred_all.std(unbiased=False)
+            target_std = target.std(unbiased=False)
+            if pred_all.numel() >= 2 and pred_std > eps and target_std > eps:
+                corr = torch.corrcoef(torch.stack([pred_all, target]))[0, 1]
+            else:
+                corr = torch.tensor(float('nan'), device=pred_all.device)
+            top10_overlap = _topk_overlap(pred_all, target, 0.10)
+
         last_stats = {
             'skipped': False,
             'valid_anchors': valid_count,
@@ -134,7 +156,17 @@ def train_error_field_steps(
             'loss_data': float(loss_data.detach().item()),
             'loss_sparse': float(loss_sparse.detach().item()),
             'loss_smooth': float(loss_smooth.detach().item()),
+            'target_min': float(target.min().detach().item()),
             'target_mean': float(target.mean().detach().item()),
+            'target_max': float(target.max().detach().item()),
+            'target_std': float(target_std.detach().item()),
+            'pred_min': float(pred_all.min().detach().item()),
+            'pred_mean': float(pred_all.mean().detach().item()),
+            'pred_max': float(pred_all.max().detach().item()),
+            'pred_std': float(pred_std.detach().item()),
+            'corr_pred_target': float(corr.detach().item()),
+            'top10_overlap': float(top10_overlap.detach().item()),
+            'weight_mean': float(weight.mean().detach().item()),
             'bbox_min': bbox_min.detach(),
             'bbox_max': bbox_max.detach(),
         }
